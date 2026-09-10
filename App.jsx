@@ -9,30 +9,37 @@ import {
   Volume2,
 } from 'lucide-react';
 
+const APP_VERSION = '1.1.0-preamble-diagnostics';
+
 const AUDIO_CONFIG = {
   dataTones: [1200, 1700, 2200, 2700],
-  startMarker: [4000, 3400, 4000],
+  // Новый preamble использует частоты, которые Fold уже уверенно распознал.
+  startMarker: [2700, 1700, 1200, 2700, 1700, 1200],
+  markerToneDuration: 0.05,
+  markerGapDuration: 0.024,
   toneDuration: 0.024,
   gapDuration: 0.012,
-  leadSilence: 0.08,
-  tailSilence: 0.05,
+  leadSilence: 0.1,
+  tailSilence: 0.08,
   amplitude: 0.72,
   maxPayloadBytes: 256,
+  selfTestTimeoutMs: 3000,
 };
 
 const RECEIVER_WORKLET = `
 class FskReceiverProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.frequencies = [1200, 1700, 2200, 2700, 3400, 4000];
+    this.frequencies = [1200, 1700, 2200, 2700];
     this.noiseFloor = 0.0015;
     this.thresholdFactor = 3.7;
     this.segment = [];
     this.active = false;
     this.silenceBlocks = 0;
     this.blockCounter = 0;
-    this.minToneSamples = Math.floor(sampleRate * 0.012);
-    this.maxToneSamples = Math.floor(sampleRate * 0.06);
+    this.minToneSamples = Math.floor(sampleRate * 0.01);
+    // 80 ms оставляет запас для длинного preamble и комнатного хвоста.
+    this.maxToneSamples = Math.floor(sampleRate * 0.08);
 
     this.port.onmessage = (event) => {
       if (event.data?.type === 'sensitivity') {
@@ -175,12 +182,15 @@ function createFrame(payloadObj) {
     throw new Error(`Пакет слишком большой: ${payload.length} байт. Максимум ${AUDIO_CONFIG.maxPayloadBytes}.`);
   }
 
-  const crc = crc16Ccitt(payload);
-  const frame = new Uint8Array(2 + payload.length + 2);
+  // CRC защищает и поле длины, и payload.
+  const protectedBytes = new Uint8Array(2 + payload.length);
+  protectedBytes[0] = (payload.length >> 8) & 0xff;
+  protectedBytes[1] = payload.length & 0xff;
+  protectedBytes.set(payload, 2);
 
-  frame[0] = (payload.length >> 8) & 0xff;
-  frame[1] = payload.length & 0xff;
-  frame.set(payload, 2);
+  const crc = crc16Ccitt(protectedBytes);
+  const frame = new Uint8Array(protectedBytes.length + 2);
+  frame.set(protectedBytes, 0);
   frame[frame.length - 2] = (crc >> 8) & 0xff;
   frame[frame.length - 1] = crc & 0xff;
 
@@ -190,29 +200,28 @@ function createFrame(payloadObj) {
 function makeAudioBuffer(ctx, payloadObj) {
   const frame = createFrame(payloadObj);
   const symbols = bytesToSymbols(frame);
-  const sequence = [
-    ...AUDIO_CONFIG.startMarker,
-    ...symbols.map((symbol) => AUDIO_CONFIG.dataTones[symbol]),
-  ];
+  const dataFrequencies = symbols.map((symbol) => AUDIO_CONFIG.dataTones[symbol]);
 
   const sampleRate = ctx.sampleRate;
-  const toneSamples = Math.round(sampleRate * AUDIO_CONFIG.toneDuration);
-  const gapSamples = Math.round(sampleRate * AUDIO_CONFIG.gapDuration);
+  const markerToneSamples = Math.round(sampleRate * AUDIO_CONFIG.markerToneDuration);
+  const markerGapSamples = Math.round(sampleRate * AUDIO_CONFIG.markerGapDuration);
+  const dataToneSamples = Math.round(sampleRate * AUDIO_CONFIG.toneDuration);
+  const dataGapSamples = Math.round(sampleRate * AUDIO_CONFIG.gapDuration);
   const leadSamples = Math.round(sampleRate * AUDIO_CONFIG.leadSilence);
   const tailSamples = Math.round(sampleRate * AUDIO_CONFIG.tailSilence);
   const fadeSamples = Math.max(1, Math.round(sampleRate * 0.002));
 
   const totalSamples =
     leadSamples +
-    sequence.length * (toneSamples + gapSamples) +
+    AUDIO_CONFIG.startMarker.length * (markerToneSamples + markerGapSamples) +
+    dataFrequencies.length * (dataToneSamples + dataGapSamples) +
     tailSamples;
 
   const buffer = ctx.createBuffer(1, totalSamples, sampleRate);
   const data = buffer.getChannelData(0);
-
   let offset = leadSamples;
 
-  for (const frequency of sequence) {
+  const writeTone = (frequency, toneSamples, gapSamples) => {
     for (let i = 0; i < toneSamples; i++) {
       const attack = Math.min(1, i / fadeSamples);
       const release = Math.min(1, (toneSamples - 1 - i) / fadeSamples);
@@ -222,8 +231,15 @@ function makeAudioBuffer(ctx, payloadObj) {
         AUDIO_CONFIG.amplitude *
         envelope;
     }
-
     offset += toneSamples + gapSamples;
+  };
+
+  for (const frequency of AUDIO_CONFIG.startMarker) {
+    writeTone(frequency, markerToneSamples, markerGapSamples);
+  }
+
+  for (const frequency of dataFrequencies) {
+    writeTone(frequency, dataToneSamples, dataGapSamples);
   }
 
   return buffer;
@@ -238,6 +254,32 @@ function nowTime() {
 
 function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const SELF_TEST_STEPS = [
+  ['microphone', 'Микрофон открыт'],
+  ['worklet', 'AudioWorklet запущен'],
+  ['tx', 'TX воспроизведён'],
+  ['signal', 'Акустический сигнал услышан'],
+  ['tone', 'FSK-тон распознан'],
+  ['marker', 'Стартовый маркер найден'],
+  ['length', 'Длина кадра прочитана'],
+  ['crc', 'CRC16 совпал'],
+  ['json', 'Payload декодирован'],
+];
+
+function makeSelfTestState(status = 'idle') {
+  return {
+    status,
+    reason: '',
+    steps: Object.fromEntries(
+      SELF_TEST_STEPS.map(([key]) => [key, { status: 'pending', detail: '' }]),
+    ),
+  };
+}
+
+function payloadByteLength(payloadObj) {
+  return new TextEncoder().encode(JSON.stringify(payloadObj)).length;
 }
 
 export default function App() {
@@ -264,10 +306,13 @@ export default function App() {
   const [txStatus, setTxStatus] = useState('TX свободен');
   const [lastTone, setLastTone] = useState(null);
   const [signalLevel, setSignalLevel] = useState(0);
-  const [rxSensitivity, setRxSensitivity] = useState(3);
+  const [rxSensitivity, setRxSensitivity] = useState(2);
   const [lastError, setLastError] = useState('');
   const [micSettings, setMicSettings] = useState(null);
   const [discoveredPings, setDiscoveredPings] = useState([]);
+  const [recentTones, setRecentTones] = useState([]);
+  const [markerProgressView, setMarkerProgressView] = useState(0);
+  const [selfTest, setSelfTest] = useState(() => makeSelfTestState());
 
   const audioCtxRef = useRef(null);
   const micStreamRef = useRef(null);
@@ -287,6 +332,10 @@ export default function App() {
   const symbolBufferRef = useRef([]);
   const frameBytesRef = useRef([]);
   const expectedFrameBytesRef = useRef(null);
+  const selfTestActiveRef = useRef(false);
+  const selfTestIdRef = useRef(null);
+  const selfTestTimeoutRef = useRef(null);
+  const selfTestTxStartedRef = useRef(false);
 
   async function ensureAudioContext() {
     if (!audioCtxRef.current) {
@@ -324,6 +373,8 @@ export default function App() {
   }
 
   function resetFrameReceiver(status = 'Ожидание маркера') {
+    markerProgressRef.current = 0;
+    setMarkerProgressView(0);
     receivingRef.current = false;
     symbolBufferRef.current = [];
     frameBytesRef.current = [];
@@ -331,9 +382,96 @@ export default function App() {
     setRxStatus(status);
   }
 
+  function markSelfTestStep(key, detail = '') {
+    if (!selfTestActiveRef.current) return;
+
+    setSelfTest((prev) => {
+      if (prev.steps[key]?.status === 'pass') return prev;
+      return {
+        ...prev,
+        steps: {
+          ...prev.steps,
+          [key]: { status: 'pass', detail },
+        },
+      };
+    });
+  }
+
+  function clearSelfTestTimer() {
+    if (selfTestTimeoutRef.current) {
+      clearTimeout(selfTestTimeoutRef.current);
+      selfTestTimeoutRef.current = null;
+    }
+  }
+
+  function failSelfTest(reason, failedStep = null) {
+    if (!selfTestActiveRef.current) return;
+
+    selfTestActiveRef.current = false;
+    selfTestTxStartedRef.current = false;
+    clearSelfTestTimer();
+
+    setSelfTest((prev) => {
+      const steps = { ...prev.steps };
+      if (failedStep && steps[failedStep]?.status !== 'pass') {
+        steps[failedStep] = { status: 'fail', detail: reason };
+      }
+      return { ...prev, status: 'fail', reason, steps };
+    });
+  }
+
+  function passSelfTest() {
+    if (!selfTestActiveRef.current) return;
+
+    selfTestActiveRef.current = false;
+    selfTestTxStartedRef.current = false;
+    clearSelfTestTimer();
+    setSelfTest((prev) => ({
+      ...prev,
+      status: 'pass',
+      reason: 'Полный акустический loopback принят и проверен.',
+      // Если RX завершился на несколько миллисекунд раньше source.onended,
+      // PASS всё равно означает, что вся цепочка реально прошла успешно.
+      steps: Object.fromEntries(
+        SELF_TEST_STEPS.map(([key]) => [
+          key,
+          prev.steps[key]?.status === 'pass'
+            ? prev.steps[key]
+            : { status: 'pass', detail: prev.steps[key]?.detail || '' },
+        ]),
+      ),
+    }));
+  }
+
+  function scheduleSelfTestTimeout() {
+    clearSelfTestTimer();
+    selfTestTimeoutRef.current = setTimeout(() => {
+      failSelfTest('RX не завершил self-test в течение 3 секунд после окончания TX.');
+    }, AUDIO_CONFIG.selfTestTimeoutMs);
+  }
+
   function handleDecodedPayload(payload) {
     if (!payload || payload.v !== 1 || typeof payload.t !== 'string') {
       setRxStatus('RX: пакет неизвестной версии');
+      failSelfTest('Неизвестная версия или тип payload.', 'json');
+      return;
+    }
+
+    if (payload.t === 'selftest') {
+      if (selfTestActiveRef.current && payload.id === selfTestIdRef.current) {
+        setRxStatus('RX: SELF-TEST принят, CRC OK');
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: crypto.randomUUID(),
+            sender: 'Система',
+            text: '✅ SELF-TEST PASS: пакет прошёл через динамик → микрофон → FSK → CRC → JSON.',
+            time: nowTime(),
+            kind: 'system',
+          },
+        ]);
+        passSelfTest();
+      }
       return;
     }
 
@@ -386,20 +524,25 @@ export default function App() {
     if (bytes.length >= 2 && expectedFrameBytesRef.current == null) {
       const payloadLength = (bytes[0] << 8) | bytes[1];
 
-      if (payloadLength < 2 || payloadLength > AUDIO_CONFIG.maxPayloadBytes) {
-        resetFrameReceiver(`RX: неверная длина ${payloadLength}`);
+      if (payloadLength < 1 || payloadLength > AUDIO_CONFIG.maxPayloadBytes) {
+        const reason = `RX: неверная длина ${payloadLength}`;
+        resetFrameReceiver(reason);
+        failSelfTest(reason, 'length');
         return;
       }
 
       expectedFrameBytesRef.current = 2 + payloadLength + 2;
       setRxStatus(`RX: пакет ${payloadLength} байт`);
+      markSelfTestStep('length', `${payloadLength} байт`);
     }
 
     const expected = expectedFrameBytesRef.current;
     if (expected == null || bytes.length < expected) return;
 
     if (bytes.length > expected) {
-      resetFrameReceiver('RX: переполнение кадра');
+      const reason = 'RX: переполнение кадра';
+      resetFrameReceiver(reason);
+      failSelfTest(reason, 'length');
       return;
     }
 
@@ -408,20 +551,27 @@ export default function App() {
     const receivedCrc =
       (bytes[2 + payloadLength] << 8) |
       bytes[3 + payloadLength];
-    const calculatedCrc = crc16Ccitt(payloadBytes);
+    const protectedBytes = Uint8Array.from(bytes.slice(0, 2 + payloadLength));
+    const calculatedCrc = crc16Ccitt(protectedBytes);
 
     if (receivedCrc !== calculatedCrc) {
-      resetFrameReceiver('RX: CRC ERROR — пакет отброшен');
+      const reason = 'RX: CRC ERROR — пакет отброшен';
+      resetFrameReceiver(reason);
+      failSelfTest(reason, 'crc');
       return;
     }
+
+    markSelfTestStep('crc', `0x${receivedCrc.toString(16).padStart(4, '0')}`);
 
     try {
       const json = new TextDecoder('utf-8', { fatal: true }).decode(payloadBytes);
       const payload = JSON.parse(json);
+      markSelfTestStep('json', payload.t || 'payload');
       handleDecodedPayload(payload);
     } catch (error) {
       setLastError(`RX decode: ${error.message}`);
       setRxStatus('RX: ошибка декодирования payload');
+      failSelfTest(`RX decode: ${error.message}`, 'json');
     } finally {
       receivingRef.current = false;
       symbolBufferRef.current = [];
@@ -447,31 +597,44 @@ export default function App() {
 
   function consumeDetectedTone(frequency, confidence) {
     setLastTone({ frequency, confidence });
+    setRecentTones((prev) => [
+      ...prev,
+      { frequency, confidence },
+    ].slice(-18));
+
+    if (selfTestActiveRef.current && selfTestTxStartedRef.current) {
+      markSelfTestStep('tone', `${frequency} Hz`);
+    }
+
+    // После старта кадра эти же частоты являются данными, а не preamble.
+    if (receivingRef.current) {
+      consumeDataTone(frequency);
+      return;
+    }
 
     const marker = AUDIO_CONFIG.startMarker;
     const progress = markerProgressRef.current;
 
     if (frequency === marker[progress]) {
       markerProgressRef.current += 1;
+      setMarkerProgressView(markerProgressRef.current);
 
       if (markerProgressRef.current === marker.length) {
         markerProgressRef.current = 0;
+        setMarkerProgressView(0);
         receivingRef.current = true;
         symbolBufferRef.current = [];
         frameBytesRef.current = [];
         expectedFrameBytesRef.current = null;
         setRxStatus('RX: стартовый маркер найден');
+        markSelfTestStep('marker', `${marker.length}/${marker.length}`);
       }
       return;
     }
 
-    if (frequency === marker[0]) {
-      markerProgressRef.current = 1;
-      return;
-    }
-
-    markerProgressRef.current = 0;
-    consumeDataTone(frequency);
+    // Быстрый re-sync, если текущий тон может быть первым элементом marker.
+    markerProgressRef.current = frequency === marker[0] ? 1 : 0;
+    setMarkerProgressView(markerProgressRef.current);
   }
 
   function drawSpectrum(analyser) {
@@ -588,6 +751,13 @@ export default function App() {
           consumeDetectedTone(data.frequency, data.confidence);
         } else if (data?.type === 'meter') {
           setSignalLevel(data.rms || 0);
+          if (
+            selfTestActiveRef.current &&
+            selfTestTxStartedRef.current &&
+            Number(data.rms) > Number(data.threshold)
+          ) {
+            markSelfTestStep('signal', `RMS ${Number(data.rms).toFixed(4)}`);
+          }
         }
       };
 
@@ -675,18 +845,24 @@ export default function App() {
     const text = inputText.trim();
     if (!text) return;
 
+    const candidatePayload = {
+      v: 1,
+      t: 'message',
+      sender: profile.name,
+      text,
+    };
+    if (payloadByteLength(candidatePayload) > AUDIO_CONFIG.maxPayloadBytes) {
+      setLastError(`Сообщение не помещается в ${AUDIO_CONFIG.maxPayloadBytes} байт payload.`);
+      return;
+    }
+
     const rxReady = await ensureSelfReceiveReady();
     if (!rxReady) return;
 
     setInputText('');
     setLastError('');
 
-    const payload = {
-      v: 1,
-      t: 'message',
-      sender: profile.name,
-      text,
-    };
+    const payload = candidatePayload;
 
     try {
       await enqueueTransmission(payload, 'сообщение');
@@ -759,23 +935,53 @@ export default function App() {
   }
 
   async function runSelfTest() {
-    const rxReady = await ensureSelfReceiveReady();
-    if (!rxReady) return;
+    if (txQueueDepthRef.current > 0 || isTransmitting) {
+      setLastError('Дождитесь окончания текущей TX-передачи и запустите self-test ещё раз.');
+      return;
+    }
 
-    const text = `SELF-TEST ${new Date().toLocaleTimeString()}`;
+    clearSelfTestTimer();
+    selfTestActiveRef.current = true;
+    selfTestTxStartedRef.current = false;
+    selfTestIdRef.current = Math.random().toString(36).slice(2, 8);
+    setRecentTones([]);
+    setSelfTest(makeSelfTestState('running'));
+    setLastError('');
+
+    const rxReady = await ensureSelfReceiveReady();
+    if (!rxReady) {
+      failSelfTest('Не удалось запустить микрофон/RX.', 'microphone');
+      return;
+    }
+
+    markSelfTestStep('microphone', 'getUserMedia OK');
+    if (receiverNodeRef.current) {
+      markSelfTestStep('worklet', 'fsk-receiver active');
+    } else {
+      failSelfTest('AudioWorkletNode не создан.', 'worklet');
+      return;
+    }
+
+    resetFrameReceiver('RX: self-test — ожидание preamble');
+    // resetFrameReceiver сбрасывает только RX state, self-test остаётся активным.
+    selfTestTxStartedRef.current = true;
 
     try {
       await enqueueTransmission(
         {
           v: 1,
-          t: 'message',
-          sender: profile.name,
-          text,
+          t: 'selftest',
+          id: selfTestIdRef.current,
         },
         'self-test',
       );
+      markSelfTestStep('tx', 'динамик завершил воспроизведение');
+      if (selfTestActiveRef.current) {
+        scheduleSelfTestTimeout();
+      }
     } catch (error) {
       setLastError(`Self-test TX: ${error.message}`);
+      failSelfTest(`TX error: ${error.message}`, 'tx');
     }
   }
 
@@ -790,6 +996,10 @@ export default function App() {
     return () => {
       if (beaconIntervalRef.current) {
         clearInterval(beaconIntervalRef.current);
+      }
+
+      if (selfTestTimeoutRef.current) {
+        clearTimeout(selfTestTimeoutRef.current);
       }
 
       if (animationFrameRef.current) {
@@ -809,6 +1019,15 @@ export default function App() {
   }, []);
 
   const echoCancellationOn = micSettings?.echoCancellation === true;
+  const draftPayloadBytes = inputText.trim()
+    ? payloadByteLength({
+        v: 1,
+        t: 'message',
+        sender: profile.name,
+        text: inputText.trim(),
+      })
+    : 0;
+  const draftTooLarge = draftPayloadBytes > AUDIO_CONFIG.maxPayloadBytes;
 
   return (
     <div className="min-h-screen bg-slate-950 text-red-50 font-mono selection:bg-red-900 selection:text-white">
@@ -819,7 +1038,7 @@ export default function App() {
               LINGUA TECHNIS : ACOUSTIC MODEM
             </h1>
             <p className="text-[11px] text-slate-500 mt-1">
-              4-FSK • реальный RX через микрофон • CRC16
+              4-FSK • реальный RX через микрофон • CRC16 • {APP_VERSION}
             </p>
           </div>
 
@@ -897,10 +1116,56 @@ export default function App() {
               <button
                 type="button"
                 onClick={runSelfTest}
-                className="min-h-10 px-3 py-2 bg-indigo-950 text-indigo-200 border border-indigo-800/60 rounded-xl text-xs"
+                disabled={selfTest.status === 'running' || isTransmitting}
+                className="min-h-10 px-3 py-2 bg-indigo-950 disabled:opacity-50 text-indigo-200 border border-indigo-800/60 rounded-xl text-xs"
               >
-                Реальный self-test
+                {selfTest.status === 'running' ? 'Self-test выполняется…' : 'Реальный self-test'}
               </button>
+            </div>
+
+            <div className={`mb-3 rounded-xl border p-3 text-xs ${
+              selfTest.status === 'pass'
+                ? 'border-emerald-800/70 bg-emerald-950/40'
+                : selfTest.status === 'fail'
+                  ? 'border-red-800/70 bg-red-950/40'
+                  : 'border-slate-800 bg-slate-950/70'
+            }`}>
+              <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                <span className="font-bold text-slate-200">SELF-TEST DIAGNOSTICS</span>
+                <span className={`font-bold ${
+                  selfTest.status === 'pass'
+                    ? 'text-emerald-300'
+                    : selfTest.status === 'fail'
+                      ? 'text-red-300'
+                      : selfTest.status === 'running'
+                        ? 'text-amber-300'
+                        : 'text-slate-500'
+                }`}>
+                  {selfTest.status === 'pass'
+                    ? 'PASS'
+                    : selfTest.status === 'fail'
+                      ? 'FAIL'
+                      : selfTest.status === 'running'
+                        ? 'RUNNING'
+                        : 'IDLE'}
+                </span>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                {SELF_TEST_STEPS.map(([key, label]) => {
+                  const step = selfTest.steps[key];
+                  const icon = step.status === 'pass' ? '✅' : step.status === 'fail' ? '❌' : '○';
+                  return (
+                    <div key={key} className="text-[11px] text-slate-300 break-words">
+                      {icon} {label}{step.detail ? ` · ${step.detail}` : ''}
+                    </div>
+                  );
+                })}
+              </div>
+              {selfTest.reason && (
+                <p className={`mt-2 text-[11px] ${selfTest.status === 'fail' ? 'text-red-300' : 'text-emerald-300'}`}>
+                  {selfTest.reason}
+                </p>
+              )}
             </div>
 
             <div className="bg-slate-950 rounded-xl p-3 h-[360px] overflow-y-auto space-y-3 mb-3">
@@ -937,19 +1202,23 @@ export default function App() {
                 type="text"
                 value={inputText}
                 onChange={(event) => setInputText(event.target.value)}
-                maxLength={120}
-                placeholder="Сообщение до 120 символов..."
+                maxLength={160}
+                placeholder="Сообщение для акустической передачи..."
                 className="flex-1 min-w-0 bg-slate-950 border border-red-900/50 rounded-xl px-4 py-3 text-base md:text-xs text-red-100 outline-none focus:border-red-500"
               />
               <button
                 type="submit"
-                disabled={!inputText.trim()}
+                disabled={!inputText.trim() || draftTooLarge}
                 className="min-w-12 min-h-11 px-4 py-2 bg-red-700 disabled:opacity-40 text-white rounded-xl text-xs flex items-center justify-center"
                 aria-label="Отправить акустический пакет"
               >
                 <Send size={16} />
               </button>
             </form>
+            <p className={`mt-2 text-[10px] ${draftTooLarge ? 'text-red-300' : 'text-slate-500'}`}>
+              Payload: {draftPayloadBytes}/{AUDIO_CONFIG.maxPayloadBytes} байт
+              {draftTooLarge ? ' — сократите сообщение' : ''}
+            </p>
           </div>
 
           <div className="bg-slate-900/60 border border-red-900/40 rounded-2xl p-4">
@@ -963,6 +1232,7 @@ export default function App() {
                 <p>
                   Tone: {lastTone ? `${lastTone.frequency} Hz · ${lastTone.confidence.toFixed(2)}×` : '—'}
                 </p>
+                <p>Marker: {markerProgressView}/{AUDIO_CONFIG.startMarker.length}</p>
               </div>
             </div>
 
@@ -978,6 +1248,18 @@ export default function App() {
                   Микрофон отключен
                 </div>
               )}
+            </div>
+
+            <div className="mb-3 rounded-xl bg-slate-950/80 border border-slate-800 p-2.5">
+              <p className="text-[10px] text-slate-500 mb-1">Последние распознанные тоны</p>
+              <p className="text-[11px] text-emerald-300 break-words leading-5">
+                {recentTones.length > 0
+                  ? recentTones.map((tone) => tone.frequency).join(' → ')
+                  : '—'}
+              </p>
+              <p className="text-[10px] text-slate-600 mt-1">
+                Preamble: {AUDIO_CONFIG.startMarker.join(' → ')} Hz
+              </p>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-[1fr_auto] gap-3 items-end">

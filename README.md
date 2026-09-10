@@ -1,22 +1,33 @@
-# Lingua Technis Acoustic Modem
+# Lingua Technis Acoustic Modem — flat Vercel build
 
-Flat Vite/React project prepared for mobile upload to GitHub and deployment on Vercel.
+Version: **1.1.0-preamble-diagnostics**
 
-## Local run
+Все файлы лежат в корне репозитория — папка `src` не нужна.
 
-```bash
-npm install
-npm run dev
-```
+## Что изменено в этой версии
 
-## Production build
+- новый низкочастотный preamble: `2700 → 1700 → 1200 → 2700 → 1700 → 1200 Hz`;
+- marker tone = 50 ms, marker gap = 24 ms;
+- data tones остаются `1200 / 1700 / 2200 / 2700 Hz`;
+- после старта кадра RX больше не пытается распознавать preamble внутри payload;
+- SELF-TEST теперь показывает этапы PASS/FAIL;
+- добавлен лог последних распознанных тонов и progress marker;
+- CRC16 теперь защищает `length + payload`;
+- UI показывает реальный размер JSON payload в байтах и блокирует слишком большой пакет;
+- reset RX также сбрасывает progress preamble.
 
-```bash
-npm run build
-```
+## Обновление через GitHub с телефона
 
-## Vercel
+Можно заменить все файлы из этого архива. Для текущего патча критически изменён `App.jsx`; `package.json` изменён только номером версии, README — документацией.
 
-Import the GitHub repository into Vercel. Framework preset should be Vite and output directory `dist`.
+После commit Vercel должен автоматически запустить новый deployment. На странице проверь строку версии под заголовком: `1.1.0-preamble-diagnostics`.
 
-Microphone access requires HTTPS (Vercel provides HTTPS automatically) or localhost.
+## Проверка
+
+1. Открой deployment по HTTPS.
+2. Включи RX, если он выключен.
+3. Поставь чувствительность примерно 1–3/5 для первого теста.
+4. Нажми `Реальный self-test`.
+5. Смотри `SELF-TEST DIAGNOSTICS`, `Marker: x/6` и `Последние распознанные тоны`.
+
+Успех — статус `PASS` и сообщение `SELF-TEST PASS` в журнале. Если будет `FAIL`, скрин панели диагностики покажет конкретный этап, на котором остановился RX.
