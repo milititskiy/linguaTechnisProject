@@ -7,9 +7,10 @@ import {
   Radio,
   Send,
   Volume2,
+  Download,
 } from 'lucide-react';
 
-const APP_VERSION = '1.3.0-clocked-rx';
+const APP_VERSION = '1.4.0-diagnostic-export';
 
 const AUDIO_CONFIG = {
   dataTones: [1200, 1700, 2200, 2700],
@@ -99,9 +100,13 @@ class FskReceiverProcessor extends AudioWorkletProcessor {
     })).sort((a, b) => b.energy - a.energy);
     const best = ranked[0];
     const second = ranked[1];
+    const energies = {};
+    for (const item of ranked) energies[item.frequency] = item.energy;
     return {
       frequency: best.frequency,
       confidence: best.energy / Math.max(second.energy, 1e-12),
+      secondFrequency: second.frequency,
+      energies,
     };
   }
 
@@ -140,6 +145,7 @@ class FskReceiverProcessor extends AudioWorkletProcessor {
     const n = this.dataWindow.length;
     const third = Math.floor(n / 3);
     const votes = new Map();
+    const subwindows = [];
     let confidenceSum = 0;
     for (let part = 0; part < 3; part++) {
       const a = part * third;
@@ -147,6 +153,11 @@ class FskReceiverProcessor extends AudioWorkletProcessor {
       const r = this.classify(this.dataWindow.slice(a, b));
       votes.set(r.frequency, (votes.get(r.frequency) || 0) + 1);
       confidenceSum += r.confidence;
+      subwindows.push({
+        frequency: r.frequency,
+        confidence: r.confidence,
+        secondFrequency: r.secondFrequency,
+      });
     }
     const full = this.classify(this.dataWindow);
     let winner = full.frequency;
@@ -166,6 +177,11 @@ class FskReceiverProcessor extends AudioWorkletProcessor {
       symbolIndex: this.dataSymbolIndex,
       vote: bestVotes,
       fallbackFrequency: full.frequency,
+      secondFrequency: full.secondFrequency,
+      energies: full.energies,
+      subwindows,
+      audioTime: currentTime,
+      windowSamples: this.dataWindow.length,
     });
     this.dataSymbolIndex += 1;
   }
@@ -380,6 +396,37 @@ function rxModeLabel(value) {
   return 'максимальная чувствительность';
 }
 
+function bytesToHex(bytes) {
+  return Array.from(bytes || [], (byte) => byte.toString(16).padStart(2, '0')).join(' ');
+}
+
+function makeFileStamp(date = new Date()) {
+  return date.toISOString().replace(/[:.]/g, '-');
+}
+
+function downloadJson(data, filename) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function loadStoredTestLogs() {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = window.localStorage.getItem('lingua-technis-test-logs-v1');
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed.slice(-12) : [];
+  } catch {
+    return [];
+  }
+}
+
 export default function App() {
   const [profile] = useState({
     name: 'Магос-Исследователь Сегментума',
@@ -424,6 +471,7 @@ export default function App() {
   const [lastCompletedRx, setLastCompletedRx] = useState(null);
   const [isCalibrating, setIsCalibrating] = useState(false);
   const [calibrationStatus, setCalibrationStatus] = useState('');
+  const [testLogs, setTestLogs] = useState(() => loadStoredTestLogs());
 
   const audioCtxRef = useRef(null);
   const micStreamRef = useRef(null);
@@ -449,6 +497,9 @@ export default function App() {
   const selfTestTxStartedRef = useRef(false);
   const selfTestResolveRef = useRef(null);
   const selfTestModeRef = useRef('manual');
+  const activeTestLogRef = useRef(null);
+  const lastFinalizedLogRef = useRef(null);
+  const selfTestLoggedStepsRef = useRef(new Set());
   const rxStatsRef = useRef({
     symbolsReceived: 0,
     bytesReceived: 0,
@@ -519,8 +570,144 @@ export default function App() {
     receiverNodeRef.current?.port.postMessage({ type: 'reset-receiver' });
   }
 
+  function beginTestLog(testId, payload, frame) {
+    const expectedSymbols = bytesToSymbols(frame);
+    const ctx = audioCtxRef.current;
+    const startedAt = new Date();
+    activeTestLogRef.current = {
+      schemaVersion: 1,
+      appVersion: APP_VERSION,
+      testId,
+      status: 'running',
+      startedAt: startedAt.toISOString(),
+      startedAtEpochMs: startedAt.getTime(),
+      performanceStart: performance.now(),
+      sensitivity: rxSensitivity,
+      audioConfig: { ...AUDIO_CONFIG },
+      environment: {
+        userAgent: navigator.userAgent,
+        language: navigator.language,
+        hardwareConcurrency: navigator.hardwareConcurrency ?? null,
+        deviceMemory: navigator.deviceMemory ?? null,
+        audioContextSampleRate: ctx?.sampleRate ?? null,
+        audioContextBaseLatency: Number.isFinite(ctx?.baseLatency) ? ctx.baseLatency : null,
+        outputLatency: Number.isFinite(ctx?.outputLatency) ? ctx.outputLatency : null,
+        micSettings: micSettings ? { ...micSettings } : null,
+      },
+      tx: {
+        payload,
+        frameBytes: Array.from(frame),
+        frameHex: bytesToHex(frame),
+        expectedSymbols,
+        expectedFrequencies: expectedSymbols.map((symbol) => AUDIO_CONFIG.dataTones[symbol]),
+      },
+      rx: {
+        markerEvents: [],
+        dataClockStart: null,
+        symbols: [],
+        frameBytes: [],
+        frameHex: '',
+        receivedCrc: null,
+        calculatedCrc: null,
+      },
+      events: [],
+      result: null,
+    };
+    lastFinalizedLogRef.current = null;
+  }
+
+  function logTestEvent(type, detail = {}) {
+    const log = activeTestLogRef.current;
+    if (!log || log.status !== 'running') return;
+    log.events.push({
+      atMs: Math.round((performance.now() - (log.performanceStart ?? performance.now())) * 1000) / 1000,
+      wallTime: new Date().toISOString(),
+      type,
+      ...detail,
+    });
+  }
+
+  function finalizeTestLog(status, reason = '') {
+    const log = activeTestLogRef.current;
+    if (!log || log.status !== 'running') return null;
+
+    const expectedSymbols = log.tx.expectedSymbols || [];
+    const receivedSymbols = log.rx.symbols || [];
+    const mismatches = [];
+    const compareCount = Math.min(expectedSymbols.length, receivedSymbols.length);
+    const confusion = {};
+    for (let i = 0; i < compareCount; i++) {
+      const expectedSymbol = expectedSymbols[i];
+      const receivedSymbol = receivedSymbols[i]?.symbol;
+      const expectedFrequency = AUDIO_CONFIG.dataTones[expectedSymbol];
+      const receivedFrequency = receivedSymbols[i]?.frequency ?? null;
+      const key = `${expectedFrequency}->${receivedFrequency}`;
+      confusion[key] = (confusion[key] || 0) + 1;
+      if (expectedSymbol !== receivedSymbol) {
+        mismatches.push({
+          index: i,
+          expectedSymbol,
+          expectedFrequency,
+          receivedSymbol,
+          receivedFrequency,
+          confidence: receivedSymbols[i]?.confidence ?? null,
+          vote: receivedSymbols[i]?.vote ?? null,
+          energies: receivedSymbols[i]?.energies ?? null,
+        });
+      }
+    }
+
+    log.status = status;
+    log.endedAt = new Date().toISOString();
+    if (frameBytesRef.current.length > 0) {
+      log.rx.frameBytes = Array.from(frameBytesRef.current);
+      log.rx.frameHex = bytesToHex(frameBytesRef.current);
+    }
+    log.result = {
+      status,
+      reason,
+      expectedSymbolCount: expectedSymbols.length,
+      receivedSymbolCount: receivedSymbols.length,
+      comparedSymbolCount: compareCount,
+      mismatchCount: mismatches.length,
+      missingSymbolCount: Math.max(0, expectedSymbols.length - receivedSymbols.length),
+      firstMismatches: mismatches.slice(0, 40),
+      confusionMatrix: confusion,
+      rxStats: { ...rxStatsRef.current },
+    };
+
+    const finalized = JSON.parse(JSON.stringify(log));
+    lastFinalizedLogRef.current = finalized;
+    activeTestLogRef.current = null;
+    setTestLogs((prev) => [...prev, finalized].slice(-12));
+    return finalized;
+  }
+
+  function exportLastTestLog() {
+    const log = testLogs[testLogs.length - 1] || lastFinalizedLogRef.current;
+    if (!log) return;
+    downloadJson(log, `lingua-technis-${APP_VERSION}-${log.status}-${makeFileStamp()}.json`);
+  }
+
+  function exportAllTestLogs() {
+    if (testLogs.length === 0) return;
+    downloadJson(
+      {
+        exportedAt: new Date().toISOString(),
+        appVersion: APP_VERSION,
+        count: testLogs.length,
+        logs: testLogs,
+      },
+      `lingua-technis-${APP_VERSION}-all-tests-${makeFileStamp()}.json`,
+    );
+  }
+
   function markSelfTestStep(key, detail = '') {
     if (!selfTestActiveRef.current) return;
+    if (!selfTestLoggedStepsRef.current.has(key)) {
+      selfTestLoggedStepsRef.current.add(key);
+      logTestEvent('step-pass', { step: key, detail });
+    }
 
     setSelfTest((prev) => {
       if (prev.steps[key]?.status === 'pass') return prev;
@@ -550,6 +737,8 @@ export default function App() {
   function failSelfTest(reason, failedStep = null) {
     if (!selfTestActiveRef.current) return;
 
+    logTestEvent('self-test-fail', { reason, failedStep });
+    finalizeTestLog('fail', reason);
     selfTestActiveRef.current = false;
     selfTestTxStartedRef.current = false;
     clearSelfTestTimer();
@@ -575,6 +764,8 @@ export default function App() {
   function passSelfTest() {
     if (!selfTestActiveRef.current) return;
 
+    logTestEvent('self-test-pass');
+    finalizeTestLog('pass', 'Полный акустический loopback принят и проверен.');
     selfTestActiveRef.current = false;
     selfTestTxStartedRef.current = false;
     clearSelfTestTimer();
@@ -734,6 +925,19 @@ export default function App() {
     const protectedBytes = Uint8Array.from(bytes.slice(0, 2 + payloadLength));
     const calculatedCrc = crc16Ccitt(protectedBytes);
 
+    if (activeTestLogRef.current) {
+      activeTestLogRef.current.rx.receivedCrc = `0x${receivedCrc.toString(16).padStart(4, '0')}`;
+      activeTestLogRef.current.rx.calculatedCrc = `0x${calculatedCrc.toString(16).padStart(4, '0')}`;
+      activeTestLogRef.current.rx.frameBytes = Array.from(bytes);
+      activeTestLogRef.current.rx.frameHex = bytesToHex(bytes);
+    }
+    logTestEvent('crc-check', {
+      receivedCrc: `0x${receivedCrc.toString(16).padStart(4, '0')}`,
+      calculatedCrc: `0x${calculatedCrc.toString(16).padStart(4, '0')}`,
+      match: receivedCrc === calculatedCrc,
+      frameBytes: bytes.length,
+    });
+
     if (receivedCrc !== calculatedCrc) {
       const symbolsReceived = (bytes.length * 4) + symbolBufferRef.current.length;
       const reason = `RX: CRC ERROR — frame ${bytes.length}/${expected} байт, ~${symbolsReceived}/${expected * 4} символов`;
@@ -829,6 +1033,36 @@ export default function App() {
 
     if (selfTestActiveRef.current && selfTestTxStartedRef.current) {
       markSelfTestStep('tone', `${frequency} Hz`);
+    }
+
+    if (activeTestLogRef.current) {
+      if (mode === 'data') {
+        const symbol = AUDIO_CONFIG.dataTones.indexOf(frequency);
+        const index = Number.isInteger(extra.symbolIndex)
+          ? extra.symbolIndex
+          : activeTestLogRef.current.rx.symbols.length;
+        const expectedSymbol = activeTestLogRef.current.tx.expectedSymbols[index] ?? null;
+        const expectedFrequency = expectedSymbol == null ? null : AUDIO_CONFIG.dataTones[expectedSymbol];
+        activeTestLogRef.current.rx.symbols.push({
+          index,
+          wallTime: new Date().toISOString(),
+          audioTime: Number.isFinite(extra.audioTime) ? extra.audioTime : null,
+          symbol,
+          frequency,
+          expectedSymbol,
+          expectedFrequency,
+          match: expectedSymbol == null ? null : expectedSymbol === symbol,
+          confidence,
+          vote: extra.vote ?? null,
+          fallbackFrequency: extra.fallbackFrequency ?? null,
+          secondFrequency: extra.secondFrequency ?? null,
+          energies: extra.energies ?? null,
+          subwindows: extra.subwindows ?? null,
+          windowSamples: extra.windowSamples ?? null,
+        });
+      } else {
+        logTestEvent('search-tone', { frequency, confidence, energies: extra.energies ?? null });
+      }
     }
 
     if (mode === 'data' && receivingRef.current) {
@@ -927,7 +1161,12 @@ export default function App() {
       });
 
       const track = stream.getAudioTracks()[0];
-      setMicSettings(track?.getSettings?.() ?? null);
+      const actualMicSettings = track?.getSettings?.() ?? null;
+      setMicSettings(actualMicSettings);
+      if (activeTestLogRef.current) {
+        activeTestLogRef.current.environment.micSettings = actualMicSettings ? { ...actualMicSettings } : null;
+        activeTestLogRef.current.environment.audioContextSampleRate = ctx.sampleRate;
+      }
 
       const source = ctx.createMediaStreamSource(stream);
       const analyser = ctx.createAnalyser();
@@ -949,12 +1188,29 @@ export default function App() {
         if (data?.type === 'tone') {
           consumeDetectedTone(data.frequency, data.confidence, data.mode, data);
         } else if (data?.type === 'marker-progress') {
-          setMarkerProgressView(Number(data.progress) || 0);
+          const progress = Number(data.progress) || 0;
+          setMarkerProgressView(progress);
+          if (activeTestLogRef.current) {
+            activeTestLogRef.current.rx.markerEvents.push({
+              time: new Date().toISOString(),
+              progress,
+            });
+          }
+          logTestEvent('marker-progress', { progress });
         } else if (data?.type === 'marker') {
-          handleMarkerDetected(Number(data.length) || AUDIO_CONFIG.startMarker.length);
+          const length = Number(data.length) || AUDIO_CONFIG.startMarker.length;
+          logTestEvent('marker-complete', { length });
+          handleMarkerDetected(length);
         } else if (data?.type === 'data-clock-start') {
           setMarkerProgressView(0);
           setRxStatus('RX: DATA clock синхронизирован');
+          if (activeTestLogRef.current) {
+            activeTestLogRef.current.rx.dataClockStart = {
+              wallTime: new Date().toISOString(),
+              performanceMs: performance.now(),
+            };
+          }
+          logTestEvent('data-clock-start');
         } else if (data?.type === 'meter') {
           setSignalLevel(data.rms || 0);
           if (
@@ -1150,23 +1406,10 @@ export default function App() {
     selfTestActiveRef.current = true;
     selfTestTxStartedRef.current = false;
     selfTestIdRef.current = Math.random().toString(36).slice(2, 8);
+    selfTestLoggedStepsRef.current = new Set();
     setRecentTones([]);
     setSelfTest(makeSelfTestState('running'));
     setLastError('');
-
-    const rxReady = await ensureSelfReceiveReady();
-    if (!rxReady) {
-      failSelfTest('Не удалось запустить микрофон/RX.', 'microphone');
-      return;
-    }
-
-    markSelfTestStep('microphone', 'getUserMedia OK');
-    if (receiverNodeRef.current) {
-      markSelfTestStep('worklet', 'fsk-receiver active');
-    } else {
-      failSelfTest('AudioWorkletNode не создан.', 'worklet');
-      return;
-    }
 
     const selfTestPayload = {
       v: 1,
@@ -1174,6 +1417,29 @@ export default function App() {
       id: selfTestIdRef.current,
     };
     const selfTestFrame = createFrame(selfTestPayload);
+    beginTestLog(selfTestIdRef.current, selfTestPayload, selfTestFrame);
+    logTestEvent('self-test-start', {
+      expectedFrameBytes: selfTestFrame.length,
+      expectedSymbols: selfTestFrame.length * 4,
+    });
+
+    const rxReady = await ensureSelfReceiveReady();
+    if (!rxReady) {
+      failSelfTest('Не удалось запустить микрофон/RX.', 'microphone');
+      return;
+    }
+
+    if (activeTestLogRef.current) {
+      activeTestLogRef.current.environment.micSettings = micSettings ? { ...micSettings } : activeTestLogRef.current.environment.micSettings;
+      activeTestLogRef.current.environment.audioContextSampleRate = audioCtxRef.current?.sampleRate ?? null;
+    }
+    markSelfTestStep('microphone', 'getUserMedia OK');
+    if (receiverNodeRef.current) {
+      markSelfTestStep('worklet', 'fsk-receiver active');
+    } else {
+      failSelfTest('AudioWorkletNode не создан.', 'worklet');
+      return;
+    }
 
     resetFrameReceiver('RX: self-test — ожидание preamble', { preserveTxExpected: false });
     setRxStats({
@@ -1189,7 +1455,9 @@ export default function App() {
     selfTestTxStartedRef.current = true;
 
     try {
+      logTestEvent('tx-start');
       await enqueueTransmission(selfTestPayload, 'self-test');
+      logTestEvent('tx-complete');
       markSelfTestStep('tx', 'динамик завершил воспроизведение');
       if (selfTestActiveRef.current) {
         scheduleSelfTestTimeout();
@@ -1203,6 +1471,17 @@ export default function App() {
   useEffect(() => {
     rxStatsRef.current = rxStats;
   }, [rxStats]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        'lingua-technis-test-logs-v1',
+        JSON.stringify(testLogs.slice(-12)),
+      );
+    } catch {
+      // Storage может быть недоступен в приватном режиме; экспорт всё равно работает.
+    }
+  }, [testLogs]);
 
   useEffect(() => {
     receiverNodeRef.current?.port.postMessage({
@@ -1372,6 +1651,26 @@ export default function App() {
               <div className="mb-2 text-[10px] text-slate-500">
                 Tests: {testStats.total} · PASS: {testStats.pass} · FAIL: {testStats.fail}
                 {testStats.total > 0 ? ` · Success: ${Math.round((testStats.pass / testStats.total) * 100)}%` : ''}
+                {testLogs.length > 0 ? ` · Logs saved: ${testLogs.length}` : ''}
+              </div>
+              <div className="mb-3 flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={exportLastTestLog}
+                  disabled={testLogs.length === 0}
+                  className="min-h-9 px-3 py-2 rounded-lg border border-cyan-900/70 bg-cyan-950/30 text-cyan-200 disabled:opacity-40 text-[10px] flex items-center gap-1.5"
+                >
+                  <Download size={13} />
+                  Экспорт последнего лога (.json)
+                </button>
+                <button
+                  type="button"
+                  onClick={exportAllTestLogs}
+                  disabled={testLogs.length === 0}
+                  className="min-h-9 px-3 py-2 rounded-lg border border-slate-700 bg-slate-900 text-slate-300 disabled:opacity-40 text-[10px]"
+                >
+                  Экспорт всех логов ({testLogs.length})
+                </button>
               </div>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
                 {SELF_TEST_STEPS.map(([key, label]) => {
