@@ -9,7 +9,7 @@ import {
   Volume2,
 } from 'lucide-react';
 
-const APP_VERSION = '1.2.0-data-spacing-diagnostics';
+const APP_VERSION = '1.3.0-clocked-rx';
 
 const AUDIO_CONFIG = {
   dataTones: [1200, 1700, 2200, 2700],
@@ -31,68 +31,157 @@ const RECEIVER_WORKLET = `
 class FskReceiverProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.frequencies = [1200, 1700, 2200, 2700];
+    this.dataTones = [1200, 1700, 2200, 2700];
+    this.marker = [2700, 1700, 1200, 2700, 1700, 1200];
     this.noiseFloor = 0.0015;
-    this.thresholdFactor = 3.7;
+    this.thresholdFactor = 5.0;
+    this.blockCounter = 0;
+
+    // SEARCH mode: silence-separated long preamble tones.
     this.segment = [];
     this.active = false;
     this.silenceBlocks = 0;
-    this.blockCounter = 0;
     this.minToneSamples = Math.floor(sampleRate * 0.01);
-    // 80 ms оставляет запас для длинного preamble и комнатного хвоста.
     this.maxToneSamples = Math.floor(sampleRate * 0.08);
+    this.markerProgress = 0;
+
+    // CLOCKED DATA mode: after preamble we no longer depend on gaps.
+    this.waitingForDataStart = false;
+    this.dataMode = false;
+    this.dataPeriodSamples = Math.round(sampleRate * 0.064); // Clocked RX · 64 ms/symbol · 24 ms analysis window
+    this.windowStart = Math.round(sampleRate * 0.008);
+    this.windowEnd = Math.round(sampleRate * 0.032); // central 24 ms, safely inside the tone
+    this.dataPhase = 0;
+    this.dataWindow = [];
+    this.dataSymbolIndex = 0;
 
     this.port.onmessage = (event) => {
-      if (event.data?.type === 'sensitivity') {
-        const value = Math.max(1, Math.min(5, Number(event.data.value) || 3));
+      const data = event.data;
+      if (data?.type === 'sensitivity') {
+        const value = Math.max(1, Math.min(5, Number(data.value) || 1));
         this.thresholdFactor = 5.0 - (value - 1) * 0.65;
+      } else if (data?.type === 'reset-receiver') {
+        this.resetToSearch();
       }
     };
+  }
+
+  resetToSearch() {
+    this.segment = [];
+    this.active = false;
+    this.silenceBlocks = 0;
+    this.markerProgress = 0;
+    this.waitingForDataStart = false;
+    this.dataMode = false;
+    this.dataPhase = 0;
+    this.dataWindow = [];
+    this.dataSymbolIndex = 0;
   }
 
   goertzel(samples, frequency) {
     const omega = 2 * Math.PI * frequency / sampleRate;
     const coeff = 2 * Math.cos(omega);
-    let q0 = 0;
-    let q1 = 0;
-    let q2 = 0;
+    let q0 = 0, q1 = 0, q2 = 0;
     const n = samples.length;
-
     for (let i = 0; i < n; i++) {
       const window = n > 1 ? 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (n - 1)) : 1;
       q0 = samples[i] * window + coeff * q1 - q2;
       q2 = q1;
       q1 = q0;
     }
-
     return q1 * q1 + q2 * q2 - coeff * q1 * q2;
   }
 
-  classifySegment() {
+  classify(samples) {
+    const ranked = this.dataTones.map((frequency) => ({
+      frequency,
+      energy: this.goertzel(samples, frequency),
+    })).sort((a, b) => b.energy - a.energy);
+    const best = ranked[0];
+    const second = ranked[1];
+    return {
+      frequency: best.frequency,
+      confidence: best.energy / Math.max(second.energy, 1e-12),
+    };
+  }
+
+  classifySearchSegment() {
     if (this.segment.length < this.minToneSamples) {
       this.segment = [];
       return;
     }
+    const result = this.classify(this.segment);
+    this.segment = [];
+    if (result.confidence < 1.3) return;
 
-    const energies = this.frequencies.map((frequency) => ({
-      frequency,
-      energy: this.goertzel(this.segment, frequency),
-    }));
+    this.port.postMessage({ type: 'tone', mode: 'search', ...result });
+    const f = result.frequency;
+    const expected = this.marker[this.markerProgress];
+    if (f === expected) {
+      this.markerProgress += 1;
+      this.port.postMessage({ type: 'marker-progress', progress: this.markerProgress });
+      if (this.markerProgress === this.marker.length) {
+        this.markerProgress = 0;
+        this.waitingForDataStart = true;
+        this.active = false;
+        this.silenceBlocks = 0;
+        this.port.postMessage({ type: 'marker', length: this.marker.length });
+      }
+    } else {
+      this.markerProgress = f === this.marker[0] ? 1 : 0;
+      this.port.postMessage({ type: 'marker-progress', progress: this.markerProgress });
+    }
+  }
 
-    energies.sort((a, b) => b.energy - a.energy);
-    const best = energies[0];
-    const second = energies[1];
-    const confidence = best.energy / Math.max(second.energy, 1e-12);
+  classifyClockedWindow() {
+    if (this.dataWindow.length < Math.floor(sampleRate * 0.012)) return;
 
-    if (confidence >= 1.3) {
-      this.port.postMessage({
-        type: 'tone',
-        frequency: best.frequency,
-        confidence,
-      });
+    // Majority vote over 3 subwindows; full-window result breaks ties.
+    const n = this.dataWindow.length;
+    const third = Math.floor(n / 3);
+    const votes = new Map();
+    let confidenceSum = 0;
+    for (let part = 0; part < 3; part++) {
+      const a = part * third;
+      const b = part === 2 ? n : (part + 1) * third;
+      const r = this.classify(this.dataWindow.slice(a, b));
+      votes.set(r.frequency, (votes.get(r.frequency) || 0) + 1);
+      confidenceSum += r.confidence;
+    }
+    const full = this.classify(this.dataWindow);
+    let winner = full.frequency;
+    let bestVotes = 0;
+    for (const [frequency, count] of votes.entries()) {
+      if (count > bestVotes) {
+        bestVotes = count;
+        winner = frequency;
+      }
     }
 
-    this.segment = [];
+    this.port.postMessage({
+      type: 'tone',
+      mode: 'data',
+      frequency: winner,
+      confidence: confidenceSum / 3,
+      symbolIndex: this.dataSymbolIndex,
+      vote: bestVotes,
+      fallbackFrequency: full.frequency,
+    });
+    this.dataSymbolIndex += 1;
+  }
+
+  processClockedData(input) {
+    for (let i = 0; i < input.length; i++) {
+      if (this.dataPhase >= this.windowStart && this.dataPhase < this.windowEnd) {
+        this.dataWindow.push(input[i]);
+      }
+      this.dataPhase += 1;
+      if (this.dataPhase >= this.dataPeriodSamples) {
+        this.classifyClockedWindow();
+        this.dataPhase = 0;
+        this.dataWindow = [];
+      }
+    }
   }
 
   process(inputs) {
@@ -100,48 +189,48 @@ class FskReceiverProcessor extends AudioWorkletProcessor {
     if (!input) return true;
 
     let sum = 0;
-    for (let i = 0; i < input.length; i++) {
-      sum += input[i] * input[i];
-    }
+    for (let i = 0; i < input.length; i++) sum += input[i] * input[i];
     const rms = Math.sqrt(sum / input.length);
     const threshold = Math.max(0.0025, this.noiseFloor * this.thresholdFactor);
     const isTone = rms > threshold;
 
-    if (isTone) {
+    if (this.dataMode) {
+      this.processClockedData(input);
+    } else if (this.waitingForDataStart) {
+      // Only the first DATA tone uses the threshold. From then on timing is fixed.
+      if (isTone) {
+        this.waitingForDataStart = false;
+        this.dataMode = true;
+        this.dataPhase = 0;
+        this.dataWindow = [];
+        this.dataSymbolIndex = 0;
+        this.port.postMessage({ type: 'data-clock-start' });
+        this.processClockedData(input);
+      }
+    } else if (isTone) {
       this.active = true;
       this.silenceBlocks = 0;
       for (let i = 0; i < input.length; i++) {
-        if (this.segment.length < this.maxToneSamples) {
-          this.segment.push(input[i]);
-        }
+        if (this.segment.length < this.maxToneSamples) this.segment.push(input[i]);
       }
+    } else if (!this.active) {
+      this.noiseFloor = this.noiseFloor * 0.995 + rms * 0.005;
     } else {
-      if (!this.active) {
-        this.noiseFloor = this.noiseFloor * 0.995 + rms * 0.005;
-      } else {
-        this.silenceBlocks += 1;
-        if (this.silenceBlocks >= 2) {
-          this.classifySegment();
-          this.active = false;
-          this.silenceBlocks = 0;
-        }
+      this.silenceBlocks += 1;
+      if (this.silenceBlocks >= 2) {
+        this.classifySearchSegment();
+        this.active = false;
+        this.silenceBlocks = 0;
       }
     }
 
     this.blockCounter += 1;
     if (this.blockCounter % 8 === 0) {
-      this.port.postMessage({
-        type: 'meter',
-        rms,
-        noiseFloor: this.noiseFloor,
-        threshold,
-      });
+      this.port.postMessage({ type: 'meter', rms, noiseFloor: this.noiseFloor, threshold });
     }
-
     return true;
   }
 }
-
 registerProcessor('fsk-receiver', FskReceiverProcessor);
 `;
 
@@ -283,6 +372,14 @@ function payloadByteLength(payloadObj) {
   return new TextEncoder().encode(JSON.stringify(payloadObj)).length;
 }
 
+function rxModeLabel(value) {
+  if (value === 1) return 'строгая фильтрация — рекомендовано';
+  if (value === 2) return 'строгая';
+  if (value === 3) return 'средняя';
+  if (value === 4) return 'чувствительная';
+  return 'максимальная чувствительность';
+}
+
 export default function App() {
   const [profile] = useState({
     name: 'Магос-Исследователь Сегментума',
@@ -307,7 +404,7 @@ export default function App() {
   const [txStatus, setTxStatus] = useState('TX свободен');
   const [lastTone, setLastTone] = useState(null);
   const [signalLevel, setSignalLevel] = useState(0);
-  const [rxSensitivity, setRxSensitivity] = useState(2);
+  const [rxSensitivity, setRxSensitivity] = useState(1);
   const [lastError, setLastError] = useState('');
   const [micSettings, setMicSettings] = useState(null);
   const [discoveredPings, setDiscoveredPings] = useState([]);
@@ -323,6 +420,10 @@ export default function App() {
     txExpectedBytes: null,
   });
   const [selfTest, setSelfTest] = useState(() => makeSelfTestState());
+  const [testStats, setTestStats] = useState({ total: 0, pass: 0, fail: 0 });
+  const [lastCompletedRx, setLastCompletedRx] = useState(null);
+  const [isCalibrating, setIsCalibrating] = useState(false);
+  const [calibrationStatus, setCalibrationStatus] = useState('');
 
   const audioCtxRef = useRef(null);
   const micStreamRef = useRef(null);
@@ -346,6 +447,8 @@ export default function App() {
   const selfTestIdRef = useRef(null);
   const selfTestTimeoutRef = useRef(null);
   const selfTestTxStartedRef = useRef(false);
+  const selfTestResolveRef = useRef(null);
+  const selfTestModeRef = useRef('manual');
   const rxStatsRef = useRef({
     symbolsReceived: 0,
     bytesReceived: 0,
@@ -413,6 +516,7 @@ export default function App() {
       }));
     }
     setRxStatus(status);
+    receiverNodeRef.current?.port.postMessage({ type: 'reset-receiver' });
   }
 
   function markSelfTestStep(key, detail = '') {
@@ -437,12 +541,25 @@ export default function App() {
     }
   }
 
+  function resolveSelfTestResult(result) {
+    const resolver = selfTestResolveRef.current;
+    selfTestResolveRef.current = null;
+    if (resolver) resolver(result);
+  }
+
   function failSelfTest(reason, failedStep = null) {
     if (!selfTestActiveRef.current) return;
 
     selfTestActiveRef.current = false;
     selfTestTxStartedRef.current = false;
     clearSelfTestTimer();
+    receiverNodeRef.current?.port.postMessage({ type: 'reset-receiver' });
+    receivingRef.current = false;
+    setTestStats((prev) => ({
+      total: prev.total + 1,
+      pass: prev.pass,
+      fail: prev.fail + 1,
+    }));
 
     setSelfTest((prev) => {
       const steps = { ...prev.steps };
@@ -451,6 +568,8 @@ export default function App() {
       }
       return { ...prev, status: 'fail', reason, steps };
     });
+
+    resolveSelfTestResult(false);
   }
 
   function passSelfTest() {
@@ -459,6 +578,11 @@ export default function App() {
     selfTestActiveRef.current = false;
     selfTestTxStartedRef.current = false;
     clearSelfTestTimer();
+    setTestStats((prev) => ({
+      total: prev.total + 1,
+      pass: prev.pass + 1,
+      fail: prev.fail,
+    }));
     setSelfTest((prev) => ({
       ...prev,
       status: 'pass',
@@ -474,6 +598,8 @@ export default function App() {
         ]),
       ),
     }));
+
+    resolveSelfTestResult(true);
   }
 
   function scheduleSelfTestTimeout() {
@@ -616,7 +742,23 @@ export default function App() {
       return;
     }
 
-    markSelfTestStep('crc', `0x${receivedCrc.toString(16).padStart(4, '0')}`);
+    const completedSnapshot = {
+      time: nowTime(),
+      payloadLength,
+      frameBytes: expected,
+      symbols: expected * 4,
+      crc: `0x${receivedCrc.toString(16).padStart(4, '0')}`,
+    };
+    setLastCompletedRx(completedSnapshot);
+    setRxStats((prev) => ({
+      ...prev,
+      symbolsReceived: expected * 4,
+      bytesReceived: expected,
+      expectedSymbols: expected * 4,
+      expectedBytes: expected,
+      payloadLength,
+    }));
+    markSelfTestStep('crc', completedSnapshot.crc);
 
     try {
       const json = new TextDecoder('utf-8', { fatal: true }).decode(payloadBytes);
@@ -632,6 +774,7 @@ export default function App() {
       symbolBufferRef.current = [];
       frameBytesRef.current = [];
       expectedFrameBytesRef.current = null;
+      receiverNodeRef.current?.port.postMessage({ type: 'reset-receiver' });
     }
   }
 
@@ -658,54 +801,39 @@ export default function App() {
     }
   }
 
-  function consumeDetectedTone(frequency, confidence) {
+  function handleMarkerDetected(length) {
+    markerProgressRef.current = 0;
+    setMarkerProgressView(length);
+    receivingRef.current = true;
+    symbolBufferRef.current = [];
+    frameBytesRef.current = [];
+    expectedFrameBytesRef.current = null;
+    setRxStats((prev) => ({
+      ...prev,
+      symbolsReceived: 0,
+      bytesReceived: 0,
+      expectedSymbols: null,
+      expectedBytes: null,
+      payloadLength: null,
+    }));
+    setRxStatus('RX: preamble найден, ожидание DATA clock');
+    markSelfTestStep('marker', `${length}/${length}`);
+  }
+
+  function consumeDetectedTone(frequency, confidence, mode = 'search', extra = {}) {
     setLastTone({ frequency, confidence });
     setRecentTones((prev) => [
       ...prev,
-      { frequency, confidence },
+      { frequency, confidence, mode, vote: extra.vote },
     ].slice(-18));
 
     if (selfTestActiveRef.current && selfTestTxStartedRef.current) {
       markSelfTestStep('tone', `${frequency} Hz`);
     }
 
-    // После старта кадра эти же частоты являются данными, а не preamble.
-    if (receivingRef.current) {
+    if (mode === 'data' && receivingRef.current) {
       consumeDataTone(frequency);
-      return;
     }
-
-    const marker = AUDIO_CONFIG.startMarker;
-    const progress = markerProgressRef.current;
-
-    if (frequency === marker[progress]) {
-      markerProgressRef.current += 1;
-      setMarkerProgressView(markerProgressRef.current);
-
-      if (markerProgressRef.current === marker.length) {
-        markerProgressRef.current = 0;
-        setMarkerProgressView(0);
-        receivingRef.current = true;
-        symbolBufferRef.current = [];
-        frameBytesRef.current = [];
-        expectedFrameBytesRef.current = null;
-        setRxStats((prev) => ({
-          ...prev,
-          symbolsReceived: 0,
-          bytesReceived: 0,
-          expectedSymbols: null,
-          expectedBytes: null,
-          payloadLength: null,
-        }));
-        setRxStatus('RX: стартовый маркер найден');
-        markSelfTestStep('marker', `${marker.length}/${marker.length}`);
-      }
-      return;
-    }
-
-    // Быстрый re-sync, если текущий тон может быть первым элементом marker.
-    markerProgressRef.current = frequency === marker[0] ? 1 : 0;
-    setMarkerProgressView(markerProgressRef.current);
   }
 
   function drawSpectrum(analyser) {
@@ -819,7 +947,14 @@ export default function App() {
         const data = event.data;
 
         if (data?.type === 'tone') {
-          consumeDetectedTone(data.frequency, data.confidence);
+          consumeDetectedTone(data.frequency, data.confidence, data.mode, data);
+        } else if (data?.type === 'marker-progress') {
+          setMarkerProgressView(Number(data.progress) || 0);
+        } else if (data?.type === 'marker') {
+          handleMarkerDetected(Number(data.length) || AUDIO_CONFIG.startMarker.length);
+        } else if (data?.type === 'data-clock-start') {
+          setMarkerProgressView(0);
+          setRxStatus('RX: DATA clock синхронизирован');
         } else if (data?.type === 'meter') {
           setSignalLevel(data.rms || 0);
           if (
@@ -1234,6 +1369,10 @@ export default function App() {
                         : 'IDLE'}
                 </span>
               </div>
+              <div className="mb-2 text-[10px] text-slate-500">
+                Tests: {testStats.total} · PASS: {testStats.pass} · FAIL: {testStats.fail}
+                {testStats.total > 0 ? ` · Success: ${Math.round((testStats.pass / testStats.total) * 100)}%` : ''}
+              </div>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
                 {SELF_TEST_STEPS.map(([key, label]) => {
                   const step = selfTest.steps[key];
@@ -1349,7 +1488,7 @@ export default function App() {
             <div className="mb-3 rounded-xl bg-slate-950/80 border border-slate-800 p-2.5">
               <div className="flex flex-wrap justify-between gap-x-4 gap-y-1 text-[10px]">
                 <span className="text-slate-500">DATA RX</span>
-                <span className="text-slate-600">40 ms tone + 24 ms gap</span>
+                <span className="text-slate-600">Clocked RX · 64 ms/symbol · 24 ms analysis window</span>
               </div>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-1 mt-1 text-[11px]">
                 <p className="text-cyan-300">
@@ -1367,9 +1506,18 @@ export default function App() {
               </div>
             </div>
 
+            {lastCompletedRx && (
+              <div className="mb-3 rounded-xl border border-emerald-900/50 bg-emerald-950/20 p-2.5 text-[10px]">
+                <p className="text-emerald-300 font-bold">LAST CRC-VALID RX · {lastCompletedRx.time}</p>
+                <p className="text-slate-400 mt-1">
+                  Marker 6/6 · Symbols {lastCompletedRx.symbols}/{lastCompletedRx.symbols} · Bytes {lastCompletedRx.frameBytes}/{lastCompletedRx.frameBytes} · CRC {lastCompletedRx.crc}
+                </p>
+              </div>
+            )}
+
             <div className="grid grid-cols-1 md:grid-cols-[1fr_auto] gap-3 items-end">
               <label className="text-xs text-slate-300">
-                Чувствительность RX: {rxSensitivity}/5
+                Порог поиска preamble: {rxSensitivity}/5
                 <input
                   type="range"
                   min="1"

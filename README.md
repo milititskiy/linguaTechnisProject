@@ -1,42 +1,35 @@
 # Lingua Technis Acoustic Modem — flat Vercel build
 
-Version: **1.2.0-data-spacing-diagnostics**
+Version: **1.3.0-clocked-rx**
 
 Все файлы лежат в корне репозитория — папка `src` не нужна.
 
-## Что изменено в этой версии
+## Главное изменение v1.3
 
-- preamble сохранён без изменений: `2700 → 1700 → 1200 → 2700 → 1700 → 1200 Hz`;
-- marker tone = 50 ms, marker gap = 24 ms;
-- data tones остаются `1200 / 1700 / 2200 / 2700 Hz`;
-- после старта кадра RX больше не пытается распознавать preamble внутри payload;
-- SELF-TEST теперь показывает этапы PASS/FAIL;
-- добавлен лог последних распознанных тонов и progress marker;
-- CRC16 теперь защищает `length + payload`;
-- UI показывает реальный размер JSON payload в байтах и блокирует слишком большой пакет;
-- reset RX также сбрасывает progress preamble.
+После обнаружения preamble RX больше не ищет паузы между каждым DATA-тоном. Он синхронизируется по первому DATA-тону и затем читает ровно один символ каждые 64 ms. Для каждого символа анализируется центральное 24-ms окно внутри 40-ms тона. Это делает DATA RX значительно менее зависимым от акустического хвоста и эха телефона.
+
+- Preamble: `2700 → 1700 → 1200 → 2700 → 1700 → 1200 Hz` — без изменений.
+- DATA: `40 ms tone + 24 ms gap` — без изменений.
+- DATA RX: clocked/synchronous Goertzel.
+- Для каждого символа используется majority vote из 3 подокон плюс полный Goertzel-window как fallback.
+- После старта DATA threshold больше не используется для разделения символов.
+- `1/5` — стартовое значение порога поиска preamble.
+- Self-test статистика показывает PASS/FAIL rate.
+- После CRC-valid приёма сохраняется отдельный LAST CRC-VALID RX snapshot.
+- CRC16 защищает `length + payload`.
 
 ## Обновление через GitHub с телефона
 
-Можно заменить все файлы из этого архива. Для текущего патча критически изменён `App.jsx`; `package.json` изменён только номером версии, README — документацией.
+Загрузи все файлы поверх существующих и сделай Commit. Vercel должен автоматически создать новый deployment.
 
-После commit Vercel должен автоматически запустить новый deployment. На странице проверь строку версии под заголовком: `1.2.0-data-spacing-diagnostics`.
+Под заголовком приложения проверь версию: `1.3.0-clocked-rx`.
 
 ## Проверка
 
-1. Открой deployment по HTTPS.
-2. Включи RX, если он выключен.
-3. Поставь чувствительность примерно 1–3/5 для первого теста.
-4. Нажми `Реальный self-test`.
-5. Смотри `SELF-TEST DIAGNOSTICS`, `Marker: x/6` и `Последние распознанные тоны`.
+1. Открой Vercel deployment по HTTPS.
+2. Включи RX.
+3. Оставь `Порог поиска preamble` на 1/5.
+4. Запусти `Реальный self-test` несколько раз подряд.
+5. Смотри PASS/FAIL, Symbols/Bytes и LAST CRC-VALID RX.
 
-Успех — статус `PASS` и сообщение `SELF-TEST PASS` в журнале. Если будет `FAIL`, скрин панели диагностики покажет конкретный этап, на котором остановился RX.
-
-
-## v1.2 patch
-
-- Preamble unchanged: `2700 → 1700 → 1200 → 2700 → 1700 → 1200`.
-- DATA timing slowed from `24 ms + 12 ms` to `40 ms tone + 24 ms gap` for cleaner acoustic separation on the Fold.
-- Self-test timeout increased to 5 seconds after TX.
-- RX diagnostics now show received/expected symbol and byte counters.
-- Self-test diagnostics preserve the expected TX frame size so missing symbols are visible even when RX never completes CRC.
+Цель v1.3 — не единичный PASS, а повторяемое получение полного кадра `160/160 symbols` с валидным CRC.
