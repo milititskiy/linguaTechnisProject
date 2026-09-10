@@ -9,7 +9,7 @@ import {
   Volume2,
 } from 'lucide-react';
 
-const APP_VERSION = '1.1.0-preamble-diagnostics';
+const APP_VERSION = '1.2.0-data-spacing-diagnostics';
 
 const AUDIO_CONFIG = {
   dataTones: [1200, 1700, 2200, 2700],
@@ -17,13 +17,14 @@ const AUDIO_CONFIG = {
   startMarker: [2700, 1700, 1200, 2700, 1700, 1200],
   markerToneDuration: 0.05,
   markerGapDuration: 0.024,
-  toneDuration: 0.024,
-  gapDuration: 0.012,
+  // v1.2: данные передаются медленнее, чтобы Fold успевал акустически разделять символы.
+  toneDuration: 0.040,
+  gapDuration: 0.024,
   leadSilence: 0.1,
   tailSilence: 0.08,
   amplitude: 0.72,
   maxPayloadBytes: 256,
-  selfTestTimeoutMs: 3000,
+  selfTestTimeoutMs: 5000,
 };
 
 const RECEIVER_WORKLET = `
@@ -312,6 +313,15 @@ export default function App() {
   const [discoveredPings, setDiscoveredPings] = useState([]);
   const [recentTones, setRecentTones] = useState([]);
   const [markerProgressView, setMarkerProgressView] = useState(0);
+  const [rxStats, setRxStats] = useState({
+    symbolsReceived: 0,
+    bytesReceived: 0,
+    expectedSymbols: null,
+    expectedBytes: null,
+    payloadLength: null,
+    txExpectedSymbols: null,
+    txExpectedBytes: null,
+  });
   const [selfTest, setSelfTest] = useState(() => makeSelfTestState());
 
   const audioCtxRef = useRef(null);
@@ -336,6 +346,15 @@ export default function App() {
   const selfTestIdRef = useRef(null);
   const selfTestTimeoutRef = useRef(null);
   const selfTestTxStartedRef = useRef(false);
+  const rxStatsRef = useRef({
+    symbolsReceived: 0,
+    bytesReceived: 0,
+    expectedSymbols: null,
+    expectedBytes: null,
+    payloadLength: null,
+    txExpectedSymbols: null,
+    txExpectedBytes: null,
+  });
 
   async function ensureAudioContext() {
     if (!audioCtxRef.current) {
@@ -372,13 +391,27 @@ export default function App() {
     }
   }
 
-  function resetFrameReceiver(status = 'Ожидание маркера') {
+  function resetFrameReceiver(
+    status = 'Ожидание маркера',
+    { preserveTxExpected = true, preserveStats = false } = {},
+  ) {
     markerProgressRef.current = 0;
     setMarkerProgressView(0);
     receivingRef.current = false;
     symbolBufferRef.current = [];
     frameBytesRef.current = [];
     expectedFrameBytesRef.current = null;
+    if (!preserveStats) {
+      setRxStats((prev) => ({
+        symbolsReceived: 0,
+        bytesReceived: 0,
+        expectedSymbols: null,
+        expectedBytes: null,
+        payloadLength: null,
+        txExpectedSymbols: preserveTxExpected ? prev.txExpectedSymbols : null,
+        txExpectedBytes: preserveTxExpected ? prev.txExpectedBytes : null,
+      }));
+    }
     setRxStatus(status);
   }
 
@@ -446,7 +479,18 @@ export default function App() {
   function scheduleSelfTestTimeout() {
     clearSelfTestTimer();
     selfTestTimeoutRef.current = setTimeout(() => {
-      failSelfTest('RX не завершил self-test в течение 3 секунд после окончания TX.');
+      const stats = rxStatsRef.current;
+      const expectedSymbols = stats.expectedSymbols ?? stats.txExpectedSymbols;
+      const expectedBytes = stats.expectedBytes ?? stats.txExpectedBytes;
+      const symbolPart = expectedSymbols == null
+        ? `${stats.symbolsReceived} символов`
+        : `${stats.symbolsReceived}/${expectedSymbols} символов`;
+      const bytePart = expectedBytes == null
+        ? `${stats.bytesReceived} байт`
+        : `${stats.bytesReceived}/${expectedBytes} байт`;
+      failSelfTest(
+        `RX не завершил self-test за ${AUDIO_CONFIG.selfTestTimeoutMs / 1000} с после TX. Получено: ${symbolPart}, ${bytePart}.`,
+      );
     }, AUDIO_CONFIG.selfTestTimeoutMs);
   }
 
@@ -526,14 +570,24 @@ export default function App() {
 
       if (payloadLength < 1 || payloadLength > AUDIO_CONFIG.maxPayloadBytes) {
         const reason = `RX: неверная длина ${payloadLength}`;
-        resetFrameReceiver(reason);
+        resetFrameReceiver(reason, { preserveStats: true });
         failSelfTest(reason, 'length');
         return;
       }
 
       expectedFrameBytesRef.current = 2 + payloadLength + 2;
+      const expectedFrameBytes = expectedFrameBytesRef.current;
+      setRxStats((prev) => ({
+        ...prev,
+        payloadLength,
+        expectedBytes: expectedFrameBytes,
+        expectedSymbols: expectedFrameBytes * 4,
+      }));
       setRxStatus(`RX: пакет ${payloadLength} байт`);
-      markSelfTestStep('length', `${payloadLength} байт`);
+      markSelfTestStep(
+        'length',
+        `${payloadLength} байт payload · ${expectedFrameBytes} байт frame · ${expectedFrameBytes * 4} символов`,
+      );
     }
 
     const expected = expectedFrameBytesRef.current;
@@ -541,7 +595,7 @@ export default function App() {
 
     if (bytes.length > expected) {
       const reason = 'RX: переполнение кадра';
-      resetFrameReceiver(reason);
+      resetFrameReceiver(reason, { preserveStats: true });
       failSelfTest(reason, 'length');
       return;
     }
@@ -555,8 +609,9 @@ export default function App() {
     const calculatedCrc = crc16Ccitt(protectedBytes);
 
     if (receivedCrc !== calculatedCrc) {
-      const reason = 'RX: CRC ERROR — пакет отброшен';
-      resetFrameReceiver(reason);
+      const symbolsReceived = (bytes.length * 4) + symbolBufferRef.current.length;
+      const reason = `RX: CRC ERROR — frame ${bytes.length}/${expected} байт, ~${symbolsReceived}/${expected * 4} символов`;
+      resetFrameReceiver(reason, { preserveStats: true });
       failSelfTest(reason, 'crc');
       return;
     }
@@ -585,12 +640,20 @@ export default function App() {
     if (symbol === -1 || !receivingRef.current) return;
 
     symbolBufferRef.current.push(symbol);
+    setRxStats((prev) => ({
+      ...prev,
+      symbolsReceived: prev.symbolsReceived + 1,
+    }));
 
     if (symbolBufferRef.current.length === 4) {
       const [a, b, c, d] = symbolBufferRef.current;
       const byte = (a << 6) | (b << 4) | (c << 2) | d;
       frameBytesRef.current.push(byte);
       symbolBufferRef.current = [];
+      setRxStats((prev) => ({
+        ...prev,
+        bytesReceived: frameBytesRef.current.length,
+      }));
       finalizeFrameIfReady();
     }
   }
@@ -626,6 +689,14 @@ export default function App() {
         symbolBufferRef.current = [];
         frameBytesRef.current = [];
         expectedFrameBytesRef.current = null;
+        setRxStats((prev) => ({
+          ...prev,
+          symbolsReceived: 0,
+          bytesReceived: 0,
+          expectedSymbols: null,
+          expectedBytes: null,
+          payloadLength: null,
+        }));
         setRxStatus('RX: стартовый маркер найден');
         markSelfTestStep('marker', `${marker.length}/${marker.length}`);
       }
@@ -962,19 +1033,28 @@ export default function App() {
       return;
     }
 
-    resetFrameReceiver('RX: self-test — ожидание preamble');
+    const selfTestPayload = {
+      v: 1,
+      t: 'selftest',
+      id: selfTestIdRef.current,
+    };
+    const selfTestFrame = createFrame(selfTestPayload);
+
+    resetFrameReceiver('RX: self-test — ожидание preamble', { preserveTxExpected: false });
+    setRxStats({
+      symbolsReceived: 0,
+      bytesReceived: 0,
+      expectedSymbols: null,
+      expectedBytes: null,
+      payloadLength: null,
+      txExpectedSymbols: selfTestFrame.length * 4,
+      txExpectedBytes: selfTestFrame.length,
+    });
     // resetFrameReceiver сбрасывает только RX state, self-test остаётся активным.
     selfTestTxStartedRef.current = true;
 
     try {
-      await enqueueTransmission(
-        {
-          v: 1,
-          t: 'selftest',
-          id: selfTestIdRef.current,
-        },
-        'self-test',
-      );
+      await enqueueTransmission(selfTestPayload, 'self-test');
       markSelfTestStep('tx', 'динамик завершил воспроизведение');
       if (selfTestActiveRef.current) {
         scheduleSelfTestTimeout();
@@ -984,6 +1064,10 @@ export default function App() {
       failSelfTest(`TX error: ${error.message}`, 'tx');
     }
   }
+
+  useEffect(() => {
+    rxStatsRef.current = rxStats;
+  }, [rxStats]);
 
   useEffect(() => {
     receiverNodeRef.current?.port.postMessage({
@@ -1260,6 +1344,27 @@ export default function App() {
               <p className="text-[10px] text-slate-600 mt-1">
                 Preamble: {AUDIO_CONFIG.startMarker.join(' → ')} Hz
               </p>
+            </div>
+
+            <div className="mb-3 rounded-xl bg-slate-950/80 border border-slate-800 p-2.5">
+              <div className="flex flex-wrap justify-between gap-x-4 gap-y-1 text-[10px]">
+                <span className="text-slate-500">DATA RX</span>
+                <span className="text-slate-600">40 ms tone + 24 ms gap</span>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-1 mt-1 text-[11px]">
+                <p className="text-cyan-300">
+                  Symbols: {rxStats.symbolsReceived}/{rxStats.expectedSymbols ?? rxStats.txExpectedSymbols ?? '—'}
+                </p>
+                <p className="text-cyan-300">
+                  Bytes: {rxStats.bytesReceived}/{rxStats.expectedBytes ?? rxStats.txExpectedBytes ?? '—'}
+                </p>
+                <p className="text-slate-500">
+                  RX payload length: {rxStats.payloadLength ?? '—'}
+                </p>
+                <p className="text-slate-500">
+                  TX expected frame: {rxStats.txExpectedBytes ?? '—'} bytes
+                </p>
+              </div>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-[1fr_auto] gap-3 items-end">
