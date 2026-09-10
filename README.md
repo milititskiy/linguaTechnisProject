@@ -1,6 +1,6 @@
 # Lingua Technis Acoustic Modem — flat Vercel build
 
-Version: **1.4.0-diagnostic-export**
+Version: **1.4.1-soft-recovery-rx-lifecycle**
 
 Все файлы лежат в корне репозитория — папка `src` не нужна.
 
@@ -43,3 +43,13 @@ Version: **1.4.0-diagnostic-export**
 - `Экспорт всех логов` — архив до 12 последних тестов.
 
 JSON содержит версию приложения, user agent, sample rate, mic settings, AUDIO_CONFIG, ожидаемый TX frame/symbols, каждый фактически распознанный DATA symbol, Goertzel energies по 1200/1700/2200/2700 Hz, confidence, vote, mismatches, confusion matrix, RX frame hex и обе CRC. Этот JSON можно загрузить прямо в ChatGPT для разбора.
+
+
+## v1.4.1 patch
+
+- Self-test explicitly records whether RX was ON before the test.
+- If RX was OFF, self-test temporarily starts the microphone and restores RX to OFF after completion.
+- Logs capture MediaStreamTrack `enabled`, `muted`, `readyState` and real `getSettings()` snapshots.
+- Added CRC-aided soft recovery: after a full frame with CRC mismatch, the receiver tests the most ambiguous 1-2 symbol decisions against CRC16 + valid protocol JSON.
+- Recovery corrections are written into the exported diagnostic JSON.
+- Wire format, TX frequencies, preamble and timing are unchanged from v1.4.0.

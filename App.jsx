@@ -10,7 +10,7 @@ import {
   Download,
 } from 'lucide-react';
 
-const APP_VERSION = '1.4.0-diagnostic-export';
+const APP_VERSION = '1.4.1-soft-recovery-rx-lifecycle';
 
 const AUDIO_CONFIG = {
   dataTones: [1200, 1700, 2200, 2700],
@@ -400,6 +400,137 @@ function bytesToHex(bytes) {
   return Array.from(bytes || [], (byte) => byte.toString(16).padStart(2, '0')).join(' ');
 }
 
+function symbolsToBytes(symbols) {
+  if (!Array.isArray(symbols) || symbols.length % 4 !== 0) return null;
+  const bytes = new Uint8Array(symbols.length / 4);
+  for (let i = 0; i < symbols.length; i += 4) {
+    bytes[i / 4] =
+      ((symbols[i] & 0b11) << 6) |
+      ((symbols[i + 1] & 0b11) << 4) |
+      ((symbols[i + 2] & 0b11) << 2) |
+      (symbols[i + 3] & 0b11);
+  }
+  return bytes;
+}
+
+function validateFrameCandidate(frameBytes) {
+  if (!(frameBytes instanceof Uint8Array) || frameBytes.length < 5) return null;
+  const payloadLength = (frameBytes[0] << 8) | frameBytes[1];
+  const expectedLength = 2 + payloadLength + 2;
+  if (payloadLength < 1 || payloadLength > AUDIO_CONFIG.maxPayloadBytes || frameBytes.length !== expectedLength) {
+    return null;
+  }
+
+  const receivedCrc = (frameBytes[2 + payloadLength] << 8) | frameBytes[3 + payloadLength];
+  const calculatedCrc = crc16Ccitt(frameBytes.subarray(0, 2 + payloadLength));
+  if (receivedCrc !== calculatedCrc) return null;
+
+  try {
+    const payloadBytes = frameBytes.subarray(2, 2 + payloadLength);
+    const json = new TextDecoder('utf-8', { fatal: true }).decode(payloadBytes);
+    const payload = JSON.parse(json);
+    if (!payload || payload.v !== 1 || typeof payload.t !== 'string') return null;
+    return { payloadLength, receivedCrc, calculatedCrc, payload, frameBytes };
+  } catch {
+    return null;
+  }
+}
+
+function attemptCrcAidedRecovery(frameBytes, decisions) {
+  const originalSymbols = bytesToSymbols(frameBytes);
+  const useful = [];
+
+  for (let i = 0; i < originalSymbols.length; i++) {
+    const decision = decisions?.[i];
+    if (!decision) continue;
+    const current = originalSymbols[i];
+    const energies = decision.energies || {};
+    const alternatives = AUDIO_CONFIG.dataTones
+      .map((frequency, symbol) => ({
+        symbol,
+        frequency,
+        energy: Number(energies[frequency] ?? 0),
+      }))
+      .filter((item) => item.symbol !== current)
+      .sort((a, b) => b.energy - a.energy);
+
+    useful.push({
+      index: i,
+      current,
+      confidence: Number.isFinite(decision.confidence) ? decision.confidence : Infinity,
+      alternatives,
+    });
+  }
+
+  useful.sort((a, b) => a.confidence - b.confidence);
+  const validCandidates = new Map();
+
+  const rememberIfValid = (symbols, corrections) => {
+    const bytes = symbolsToBytes(symbols);
+    const valid = bytes ? validateFrameCandidate(bytes) : null;
+    if (!valid) return;
+    const key = bytesToHex(bytes);
+    if (!validCandidates.has(key)) {
+      validCandidates.set(key, { ...valid, corrections });
+    }
+  };
+
+  // Сначала проверяем одиночные замены среди самых неоднозначных решений.
+  const singles = useful.slice(0, 24);
+  for (const candidate of singles) {
+    for (const alt of candidate.alternatives.slice(0, 2)) {
+      const symbols = originalSymbols.slice();
+      symbols[candidate.index] = alt.symbol;
+      rememberIfValid(symbols, [{
+        index: candidate.index,
+        fromSymbol: candidate.current,
+        toSymbol: alt.symbol,
+        fromFrequency: AUDIO_CONFIG.dataTones[candidate.current],
+        toFrequency: alt.frequency,
+        confidence: candidate.confidence,
+      }]);
+    }
+  }
+
+  // Если одиночной замены нет, пробуем пары среди 8 самых слабых решений.
+  if (validCandidates.size === 0) {
+    const pairs = useful.slice(0, 8);
+    for (let a = 0; a < pairs.length; a++) {
+      for (let b = a + 1; b < pairs.length; b++) {
+        for (const altA of pairs[a].alternatives.slice(0, 2)) {
+          for (const altB of pairs[b].alternatives.slice(0, 2)) {
+            const symbols = originalSymbols.slice();
+            symbols[pairs[a].index] = altA.symbol;
+            symbols[pairs[b].index] = altB.symbol;
+            rememberIfValid(symbols, [
+              {
+                index: pairs[a].index,
+                fromSymbol: pairs[a].current,
+                toSymbol: altA.symbol,
+                fromFrequency: AUDIO_CONFIG.dataTones[pairs[a].current],
+                toFrequency: altA.frequency,
+                confidence: pairs[a].confidence,
+              },
+              {
+                index: pairs[b].index,
+                fromSymbol: pairs[b].current,
+                toSymbol: altB.symbol,
+                fromFrequency: AUDIO_CONFIG.dataTones[pairs[b].current],
+                toFrequency: altB.frequency,
+                confidence: pairs[b].confidence,
+              },
+            ]);
+          }
+        }
+      }
+    }
+  }
+
+  // Не принимаем неоднозначное восстановление: CRC+JSON должны указывать ровно на один кадр.
+  if (validCandidates.size !== 1) return null;
+  return [...validCandidates.values()][0];
+}
+
 function makeFileStamp(date = new Date()) {
   return date.toISOString().replace(/[:.]/g, '-');
 }
@@ -472,6 +603,11 @@ export default function App() {
   const [isCalibrating, setIsCalibrating] = useState(false);
   const [calibrationStatus, setCalibrationStatus] = useState('');
   const [testLogs, setTestLogs] = useState(() => loadStoredTestLogs());
+  const [selfTestRxLifecycle, setSelfTestRxLifecycle] = useState({
+    wasOnBeforeTest: null,
+    autoStarted: false,
+    restoredAfterTest: false,
+  });
 
   const audioCtxRef = useRef(null);
   const micStreamRef = useRef(null);
@@ -500,6 +636,10 @@ export default function App() {
   const activeTestLogRef = useRef(null);
   const lastFinalizedLogRef = useRef(null);
   const selfTestLoggedStepsRef = useRef(new Set());
+  const selfTestRxWasOnRef = useRef(false);
+  const selfTestAutoStartedRxRef = useRef(false);
+  const selfTestRestorePendingRef = useRef(false);
+  const rxSymbolDecisionsRef = useRef([]);
   const rxStatsRef = useRef({
     symbolsReceived: 0,
     bytesReceived: 0,
@@ -509,6 +649,50 @@ export default function App() {
     txExpectedSymbols: null,
     txExpectedBytes: null,
   });
+
+  function captureMicTrackState() {
+    const stream = micStreamRef.current;
+    const track = stream?.getAudioTracks?.()[0] ?? null;
+    return {
+      streamPresent: Boolean(stream),
+      trackPresent: Boolean(track),
+      enabled: track?.enabled ?? null,
+      muted: track?.muted ?? null,
+      readyState: track?.readyState ?? null,
+      settings: track?.getSettings?.() ? { ...track.getSettings() } : null,
+    };
+  }
+
+  function updateFinalizedLogLifecycle(patch) {
+    const testId = selfTestIdRef.current;
+    if (!testId) return;
+    if (lastFinalizedLogRef.current?.testId === testId) {
+      lastFinalizedLogRef.current.rxLifecycle = {
+        ...(lastFinalizedLogRef.current.rxLifecycle || {}),
+        ...patch,
+      };
+    }
+    setTestLogs((prev) => prev.map((log) =>
+      log.testId === testId
+        ? { ...log, rxLifecycle: { ...(log.rxLifecycle || {}), ...patch } }
+        : log
+    ));
+  }
+
+  function restoreRxAfterSelfTestIfNeeded() {
+    if (!selfTestRestorePendingRef.current) return;
+    selfTestRestorePendingRef.current = false;
+    const beforeStop = captureMicTrackState();
+    stopListening();
+    const afterStop = captureMicTrackState();
+    setSelfTestRxLifecycle((prev) => ({ ...prev, restoredAfterTest: true }));
+    updateFinalizedLogLifecycle({
+      restoreRequested: true,
+      beforeRestore: beforeStop,
+      afterRestore: afterStop,
+      restoredAt: new Date().toISOString(),
+    });
+  }
 
   async function ensureAudioContext() {
     if (!audioCtxRef.current) {
@@ -554,6 +738,7 @@ export default function App() {
     receivingRef.current = false;
     symbolBufferRef.current = [];
     frameBytesRef.current = [];
+    rxSymbolDecisionsRef.current = [];
     expectedFrameBytesRef.current = null;
     if (!preserveStats) {
       setRxStats((prev) => ({
@@ -575,7 +760,7 @@ export default function App() {
     const ctx = audioCtxRef.current;
     const startedAt = new Date();
     activeTestLogRef.current = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       appVersion: APP_VERSION,
       testId,
       status: 'running',
@@ -584,6 +769,15 @@ export default function App() {
       performanceStart: performance.now(),
       sensitivity: rxSensitivity,
       audioConfig: { ...AUDIO_CONFIG },
+      rxLifecycle: {
+        wasOnBeforeTest: selfTestRxWasOnRef.current,
+        autoStartedBySelfTest: selfTestAutoStartedRxRef.current,
+        beforeTest: captureMicTrackState(),
+        afterStart: null,
+        restoreRequested: false,
+        beforeRestore: null,
+        afterRestore: null,
+      },
       environment: {
         userAgent: navigator.userAgent,
         language: navigator.language,
@@ -592,7 +786,8 @@ export default function App() {
         audioContextSampleRate: ctx?.sampleRate ?? null,
         audioContextBaseLatency: Number.isFinite(ctx?.baseLatency) ? ctx.baseLatency : null,
         outputLatency: Number.isFinite(ctx?.outputLatency) ? ctx.outputLatency : null,
-        micSettings: micSettings ? { ...micSettings } : null,
+        micSettings: captureMicTrackState().settings,
+        micTrackStateAtLogStart: captureMicTrackState(),
       },
       tx: {
         payload,
@@ -609,6 +804,7 @@ export default function App() {
         frameHex: '',
         receivedCrc: null,
         calculatedCrc: null,
+        recovery: null,
       },
       events: [],
       result: null,
@@ -659,6 +855,13 @@ export default function App() {
 
     log.status = status;
     log.endedAt = new Date().toISOString();
+    log.rxLifecycle = {
+      ...(log.rxLifecycle || {}),
+      wasOnBeforeTest: selfTestRxWasOnRef.current,
+      autoStartedBySelfTest: selfTestAutoStartedRxRef.current,
+      atFinalize: captureMicTrackState(),
+      restoreRequested: selfTestAutoStartedRxRef.current && !selfTestRxWasOnRef.current,
+    };
     if (frameBytesRef.current.length > 0) {
       log.rx.frameBytes = Array.from(frameBytesRef.current);
       log.rx.frameHex = bytesToHex(frameBytesRef.current);
@@ -758,6 +961,13 @@ export default function App() {
       return { ...prev, status: 'fail', reason, steps };
     });
 
+    if (selfTestAutoStartedRxRef.current && !selfTestRxWasOnRef.current) {
+      selfTestRestorePendingRef.current = true;
+      if (txQueueDepthRef.current === 0) {
+        setTimeout(restoreRxAfterSelfTestIfNeeded, 50);
+      }
+    }
+
     resolveSelfTestResult(false);
   }
 
@@ -789,6 +999,13 @@ export default function App() {
         ]),
       ),
     }));
+
+    if (selfTestAutoStartedRxRef.current && !selfTestRxWasOnRef.current) {
+      selfTestRestorePendingRef.current = true;
+      if (txQueueDepthRef.current === 0) {
+        setTimeout(restoreRxAfterSelfTestIfNeeded, 50);
+      }
+    }
 
     resolveSelfTestResult(true);
   }
@@ -917,33 +1134,73 @@ export default function App() {
       return;
     }
 
-    const payloadLength = (bytes[0] << 8) | bytes[1];
-    const payloadBytes = Uint8Array.from(bytes.slice(2, 2 + payloadLength));
-    const receivedCrc =
-      (bytes[2 + payloadLength] << 8) |
-      bytes[3 + payloadLength];
-    const protectedBytes = Uint8Array.from(bytes.slice(0, 2 + payloadLength));
-    const calculatedCrc = crc16Ccitt(protectedBytes);
+    let finalFrame = Uint8Array.from(bytes);
+    let payloadLength = (finalFrame[0] << 8) | finalFrame[1];
+    let payloadBytes = finalFrame.subarray(2, 2 + payloadLength);
+    let receivedCrc =
+      (finalFrame[2 + payloadLength] << 8) |
+      finalFrame[3 + payloadLength];
+    let protectedBytes = finalFrame.subarray(0, 2 + payloadLength);
+    let calculatedCrc = crc16Ccitt(protectedBytes);
+    let recoveredPayload = null;
+    let recovery = null;
 
     if (activeTestLogRef.current) {
       activeTestLogRef.current.rx.receivedCrc = `0x${receivedCrc.toString(16).padStart(4, '0')}`;
       activeTestLogRef.current.rx.calculatedCrc = `0x${calculatedCrc.toString(16).padStart(4, '0')}`;
-      activeTestLogRef.current.rx.frameBytes = Array.from(bytes);
-      activeTestLogRef.current.rx.frameHex = bytesToHex(bytes);
+      activeTestLogRef.current.rx.frameBytes = Array.from(finalFrame);
+      activeTestLogRef.current.rx.frameHex = bytesToHex(finalFrame);
     }
     logTestEvent('crc-check', {
       receivedCrc: `0x${receivedCrc.toString(16).padStart(4, '0')}`,
       calculatedCrc: `0x${calculatedCrc.toString(16).padStart(4, '0')}`,
       match: receivedCrc === calculatedCrc,
-      frameBytes: bytes.length,
+      frameBytes: finalFrame.length,
     });
 
     if (receivedCrc !== calculatedCrc) {
-      const symbolsReceived = (bytes.length * 4) + symbolBufferRef.current.length;
-      const reason = `RX: CRC ERROR — frame ${bytes.length}/${expected} байт, ~${symbolsReceived}/${expected * 4} символов`;
-      resetFrameReceiver(reason, { preserveStats: true });
-      failSelfTest(reason, 'crc');
-      return;
+      recovery = attemptCrcAidedRecovery(finalFrame, rxSymbolDecisionsRef.current);
+      if (recovery) {
+        finalFrame = recovery.frameBytes;
+        payloadLength = recovery.payloadLength;
+        payloadBytes = finalFrame.subarray(2, 2 + payloadLength);
+        receivedCrc = recovery.receivedCrc;
+        calculatedCrc = recovery.calculatedCrc;
+        protectedBytes = finalFrame.subarray(0, 2 + payloadLength);
+        recoveredPayload = recovery.payload;
+        const correctionText = recovery.corrections
+          .map((item) => `#${item.index}: ${item.fromFrequency}→${item.toFrequency} Hz`)
+          .join(', ');
+        setRxStatus(`RX: CRC восстановлен · ${recovery.corrections.length} символ(а)`);
+        markSelfTestStep('crc', `soft recovery: ${correctionText}`);
+        logTestEvent('crc-soft-recovery-success', {
+          corrections: recovery.corrections,
+          correctedFrameHex: bytesToHex(finalFrame),
+          crc: `0x${receivedCrc.toString(16).padStart(4, '0')}`,
+        });
+        if (activeTestLogRef.current) {
+          activeTestLogRef.current.rx.recovery = {
+            success: true,
+            corrections: recovery.corrections,
+            correctedFrameBytes: Array.from(finalFrame),
+            correctedFrameHex: bytesToHex(finalFrame),
+          };
+          activeTestLogRef.current.rx.receivedCrc = `0x${receivedCrc.toString(16).padStart(4, '0')}`;
+          activeTestLogRef.current.rx.calculatedCrc = `0x${calculatedCrc.toString(16).padStart(4, '0')}`;
+        }
+      } else {
+        if (activeTestLogRef.current) {
+          activeTestLogRef.current.rx.recovery = { success: false, corrections: [] };
+        }
+        logTestEvent('crc-soft-recovery-failed');
+        const symbolsReceived = (bytes.length * 4) + symbolBufferRef.current.length;
+        const reason = `RX: CRC ERROR — frame ${bytes.length}/${expected} байт, ~${symbolsReceived}/${expected * 4} символов`;
+        resetFrameReceiver(reason, { preserveStats: true });
+        failSelfTest(reason, 'crc');
+        return;
+      }
+    } else {
+      markSelfTestStep('crc', `0x${receivedCrc.toString(16).padStart(4, '0')}`);
     }
 
     const completedSnapshot = {
@@ -962,11 +1219,14 @@ export default function App() {
       expectedBytes: expected,
       payloadLength,
     }));
-    markSelfTestStep('crc', completedSnapshot.crc);
+    if (!recovery) {
+      markSelfTestStep('crc', completedSnapshot.crc);
+    }
 
     try {
-      const json = new TextDecoder('utf-8', { fatal: true }).decode(payloadBytes);
-      const payload = JSON.parse(json);
+      const payload = recoveredPayload ?? JSON.parse(
+        new TextDecoder('utf-8', { fatal: true }).decode(payloadBytes),
+      );
       markSelfTestStep('json', payload.t || 'payload');
       handleDecodedPayload(payload);
     } catch (error) {
@@ -1011,6 +1271,7 @@ export default function App() {
     receivingRef.current = true;
     symbolBufferRef.current = [];
     frameBytesRef.current = [];
+    rxSymbolDecisionsRef.current = [];
     expectedFrameBytesRef.current = null;
     setRxStats((prev) => ({
       ...prev,
@@ -1033,6 +1294,24 @@ export default function App() {
 
     if (selfTestActiveRef.current && selfTestTxStartedRef.current) {
       markSelfTestStep('tone', `${frequency} Hz`);
+    }
+
+    if (mode === 'data') {
+      const symbol = AUDIO_CONFIG.dataTones.indexOf(frequency);
+      const index = Number.isInteger(extra.symbolIndex)
+        ? extra.symbolIndex
+        : rxSymbolDecisionsRef.current.length;
+      rxSymbolDecisionsRef.current[index] = {
+        index,
+        symbol,
+        frequency,
+        confidence,
+        vote: extra.vote ?? null,
+        fallbackFrequency: extra.fallbackFrequency ?? null,
+        secondFrequency: extra.secondFrequency ?? null,
+        energies: extra.energies ?? null,
+        subwindows: extra.subwindows ?? null,
+      };
     }
 
     if (activeTestLogRef.current) {
@@ -1293,11 +1572,25 @@ export default function App() {
     return task;
   }
 
-  async function ensureSelfReceiveReady() {
+  async function ensureSelfReceiveReady({ forSelfTest = false } = {}) {
     if (!micStreamRef.current) {
+      if (forSelfTest) {
+        selfTestAutoStartedRxRef.current = true;
+        setSelfTestRxLifecycle((prev) => ({ ...prev, autoStarted: true }));
+        if (activeTestLogRef.current) {
+          activeTestLogRef.current.rxLifecycle.autoStartedBySelfTest = true;
+        }
+        logTestEvent('rx-auto-start-requested');
+      }
       const started = await startListening();
       if (!started) return false;
       await wait(200);
+      if (forSelfTest && activeTestLogRef.current) {
+        activeTestLogRef.current.rxLifecycle.afterStart = captureMicTrackState();
+      }
+      if (forSelfTest) {
+        logTestEvent('rx-auto-started', captureMicTrackState());
+      }
     }
     return true;
   }
@@ -1403,6 +1696,17 @@ export default function App() {
     }
 
     clearSelfTestTimer();
+    const rxBefore = captureMicTrackState();
+    const rxWasOn = rxBefore.trackPresent && rxBefore.readyState === 'live';
+    selfTestRxWasOnRef.current = Boolean(rxWasOn);
+    selfTestAutoStartedRxRef.current = false;
+    selfTestRestorePendingRef.current = false;
+    setSelfTestRxLifecycle({
+      wasOnBeforeTest: Boolean(rxWasOn),
+      autoStarted: false,
+      restoredAfterTest: false,
+    });
+
     selfTestActiveRef.current = true;
     selfTestTxStartedRef.current = false;
     selfTestIdRef.current = Math.random().toString(36).slice(2, 8);
@@ -1423,15 +1727,19 @@ export default function App() {
       expectedSymbols: selfTestFrame.length * 4,
     });
 
-    const rxReady = await ensureSelfReceiveReady();
+    const rxReady = await ensureSelfReceiveReady({ forSelfTest: true });
     if (!rxReady) {
       failSelfTest('Не удалось запустить микрофон/RX.', 'microphone');
       return;
     }
 
     if (activeTestLogRef.current) {
-      activeTestLogRef.current.environment.micSettings = micSettings ? { ...micSettings } : activeTestLogRef.current.environment.micSettings;
+      const liveMicState = captureMicTrackState();
+      activeTestLogRef.current.environment.micSettings = liveMicState.settings;
+      activeTestLogRef.current.environment.micTrackState = liveMicState;
       activeTestLogRef.current.environment.audioContextSampleRate = audioCtxRef.current?.sampleRate ?? null;
+      activeTestLogRef.current.rxLifecycle.afterStart = liveMicState;
+      activeTestLogRef.current.rxLifecycle.autoStartedBySelfTest = selfTestAutoStartedRxRef.current;
     }
     markSelfTestStep('microphone', 'getUserMedia OK');
     if (receiverNodeRef.current) {
@@ -1461,6 +1769,8 @@ export default function App() {
       markSelfTestStep('tx', 'динамик завершил воспроизведение');
       if (selfTestActiveRef.current) {
         scheduleSelfTestTimeout();
+      } else {
+        restoreRxAfterSelfTestIfNeeded();
       }
     } catch (error) {
       setLastError(`Self-test TX: ${error.message}`);
@@ -1652,6 +1962,16 @@ export default function App() {
                 Tests: {testStats.total} · PASS: {testStats.pass} · FAIL: {testStats.fail}
                 {testStats.total > 0 ? ` · Success: ${Math.round((testStats.pass / testStats.total) * 100)}%` : ''}
                 {testLogs.length > 0 ? ` · Logs saved: ${testLogs.length}` : ''}
+              </div>
+              {selfTestRxLifecycle.wasOnBeforeTest !== null && (
+                <div className="mb-3 rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-[10px] text-slate-400">
+                  RX до теста: {selfTestRxLifecycle.wasOnBeforeTest ? 'ON' : 'OFF'}
+                  {selfTestRxLifecycle.autoStarted ? ' · Self-test временно включил микрофон' : ''}
+                  {selfTestRxLifecycle.restoredAfterTest ? ' · после теста RX возвращён в OFF' : ''}
+                </div>
+              )}
+              <div className="mb-3 rounded-lg border border-indigo-900/50 bg-indigo-950/20 px-3 py-2 text-[10px] text-indigo-200">
+                CRC-aided soft recovery: ON · при CRC ERROR проверяются 1–2 наиболее неоднозначных символа.
               </div>
               <div className="mb-3 flex flex-wrap gap-2">
                 <button
